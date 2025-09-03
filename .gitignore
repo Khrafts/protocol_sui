@@ -3,4 +3,4 @@ build/*
 .coverage*
 
 .DS_Store
-local/*
+protocol/
