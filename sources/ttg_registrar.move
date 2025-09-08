@@ -6,6 +6,9 @@ module protocol_sui::ttg_registrar {
     /// The parameter key for max earner rate
     const MAX_EARNER_RATE_KEY: vector<u8> = b"max_earner_rate";
     
+    /// The parameter key for base minter rate
+    const BASE_MINTER_RATE_KEY: vector<u8> = b"base_minter_rate";
+    
     // ============ Structs ============
     
     /// Dummy TTGRegistrar object for now
@@ -17,11 +20,14 @@ module protocol_sui::ttg_registrar {
     // ============ Initialization ============
     
     /// Initialize the TTGRegistrar (dummy implementation)
-    public fun initialize(ctx: &mut TxContext) {
+    fun init(ctx: &mut TxContext) {
         let mut config = table::new<vector<u8>, u256>(ctx);
         
         // Set default max earner rate to 10% (1000 basis points)
         table::add(&mut config, MAX_EARNER_RATE_KEY, 1000);
+        
+        // Set default base minter rate to 5% (500 basis points)
+        table::add(&mut config, BASE_MINTER_RATE_KEY, 500);
         
         let registrar = TTGRegistrar {
             id: object::new(ctx),
@@ -47,6 +53,11 @@ module protocol_sui::ttg_registrar {
         get(registrar, MAX_EARNER_RATE_KEY)
     }
     
+    /// Get the base minter rate specifically
+    public fun get_base_minter_rate(registrar: &TTGRegistrar): u256 {
+        get(registrar, BASE_MINTER_RATE_KEY)
+    }
+    
     // ============ Setter Functions (for testing/governance) ============
     
     public fun set(registrar: &mut TTGRegistrar, key: vector<u8>, value: u256) {
@@ -58,5 +69,14 @@ module protocol_sui::ttg_registrar {
     
     public fun set_max_earner_rate(registrar: &mut TTGRegistrar, value: u256) {
         set(registrar, MAX_EARNER_RATE_KEY, value);
+    }
+    
+    public fun set_base_minter_rate(registrar: &mut TTGRegistrar, value: u256) {
+        set(registrar, BASE_MINTER_RATE_KEY, value);
+    }
+
+    #[test_only]
+    public fun initialize(ctx: &mut TxContext) {
+        init(ctx);
     }
 }
