@@ -3,7 +3,7 @@ module protocol_sui::earner_rate_model {
     use protocol_sui::continuous_indexing_math;
     use protocol_sui::uint_math;
     use protocol_sui::minter_gateway::{Self, MinterGateway};
-    use protocol_sui::m_token::{Self, MToken};
+    use protocol_sui::m_token::{Self, MTokenState};
     use protocol_sui::ttg_registrar::{Self, TTGRegistrar};
     use integer_mate::i128;
     
@@ -33,7 +33,7 @@ module protocol_sui::earner_rate_model {
     /// This matches the Solidity implementation's external calls
     public fun rate_with_refs(
         minter_gateway: &MinterGateway,
-        m_token: &MToken,
+        m_token: &MTokenState,
         ttg_registrar: &TTGRegistrar,
         ctx: &TxContext
     ): u256 {
@@ -41,7 +41,7 @@ module protocol_sui::earner_rate_model {
         let max_earner_rate = ttg_registrar::get_max_earner_rate(ttg_registrar);
         let minter_rate = minter_gateway::minter_rate(minter_gateway);
         let total_active_owed_m = minter_gateway::total_active_owed_m(minter_gateway);
-        let total_earning_supply = m_token::total_earning_supply(m_token, ctx);
+        let total_earning_supply = m_token::total_earning_supply_from_state(m_token, ctx);
         
         // Call the pure calculation function
         rate(max_earner_rate, minter_rate, total_active_owed_m, total_earning_supply)

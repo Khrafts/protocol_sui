@@ -1,7 +1,7 @@
 #[test_only]
 module protocol_sui::m_token_test {
     use sui::test_scenario::{Self, Scenario, next_tx, ctx};
-    use protocol_sui::m_token::{Self, MToken};
+    use protocol_sui::m_token::{Self, MTokenProtocol};
     use protocol_sui::ttg_registrar::{Self, TTGRegistrar};
     use sui::object;
     use sui::coin;
@@ -13,14 +13,14 @@ module protocol_sui::m_token_test {
     const DEPLOYER: address = @0xdeadbeef;
 
     /// Creates test protocol objects using production functions where possible
-    fun setup_test_protocol(scenario: &mut Scenario): (MToken, TTGRegistrar, ID) {
+    fun setup_test_protocol(scenario: &mut Scenario): (MTokenProtocol, TTGRegistrar, ID) {
         let ctx = ctx(scenario);
         
         // Create TTG Registrar (this would normally be shared, but we keep local for testing)
         let ttg_registrar = ttg_registrar::new_for_testing(ctx);
         let ttg_registrar_id = object::id(&ttg_registrar);
         
-        // Create MToken using new_for_testing approach to keep local for testing
+        // Create MTokenProtocol using new_for_testing approach to keep local for testing
         let mtoken = m_token::new_for_testing(ttg_registrar_id, ctx);
 
         (mtoken, ttg_registrar, ttg_registrar_id)

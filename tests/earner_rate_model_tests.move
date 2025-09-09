@@ -2,7 +2,7 @@
 module protocol_sui::earner_rate_model_tests {
     use protocol_sui::earner_rate_model;
     use protocol_sui::minter_gateway::{Self, MinterGateway};
-    use protocol_sui::m_token::{Self, MToken};
+    use protocol_sui::m_token::{Self, MTokenProtocol};
     use protocol_sui::ttg_registrar::{Self, TTGRegistrar};
     use sui::test_scenario;
     
@@ -190,19 +190,19 @@ module protocol_sui::earner_rate_model_tests {
         test_scenario::next_tx(&mut scenario, TEST_ADDRESS);
         {
             let mut minter_gateway = test_scenario::take_shared<MinterGateway>(&scenario);
-            let mut m_token = test_scenario::take_shared<MToken>(&scenario);
+            let mut m_token = test_scenario::take_shared<MTokenProtocol>(&scenario);
             let mut ttg_registrar = test_scenario::take_shared<TTGRegistrar>(&scenario);
             
             // Set up test values
             minter_gateway::set_minter_rate(&mut minter_gateway, 1_000); // 10%
             minter_gateway::set_total_active_owed_m(&mut minter_gateway, 1_000_000);
-            m_token::set_total_earning_supply(&mut m_token, 500_000);
+            m_token::set_total_earning_supply_protocol(&mut m_token, 500_000);
             ttg_registrar::set_max_earner_rate(&mut ttg_registrar, 2_000); // 20% max
             
             // Call rate_with_refs
             let rate = earner_rate_model::rate_with_refs(
                 &minter_gateway,
-                &m_token,
+                m_token::get_state(&m_token),
                 &ttg_registrar,
                 test_scenario::ctx(&mut scenario)
             );

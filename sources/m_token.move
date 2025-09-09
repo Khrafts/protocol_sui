@@ -1,9 +1,11 @@
 module protocol_sui::m_token {
     use sui::table::{Self, Table};
-    use sui::coin::{Self, TreasuryCap};
+    use sui::coin::{Self, TreasuryCap, Coin};
+    use sui::transfer;
     use sui::object::{UID, ID};
     use protocol_sui::continuous_indexing::{Self, ContinuousIndexing};
     use protocol_sui::ttg_registrar;
+    use std::option;
 
     // ============ Constants ============
     
@@ -63,13 +65,13 @@ module protocol_sui::m_token {
     /// Earning account state - tracks principal amount for earning accounts
     public struct EarningState has store, drop {
         /// Principal amount for this earning account (uint112 → u128)  
-        principal_amount: u128
+        principal_amount: u128,
+        /// Last index at which interest was claimed (for calculating accrued interest)
+        last_claim_index: u128
     }
     
-    /// Main MToken object - shared object for protocol state management
-    public struct MToken has key {
-        id: UID,
-        
+    /// Main MToken state - holds the earning/non-earning tracking
+    public struct MTokenState has store {
         /// Reference to the TTG Registrar (stored as ID for validation)
         ttg_registrar_id: ID,
         
@@ -89,6 +91,16 @@ module protocol_sui::m_token {
         earning_accounts: Table<address, EarningState>
     }
     
+    /// Protocol shared object that holds both state and treasury cap
+    /// This ensures only protocol functions can mint/burn tokens
+    public struct MTokenProtocol has key {
+        id: UID,
+        /// The MToken state
+        state: MTokenState,
+        /// The treasury cap - locked here, can never be extracted
+        treasury_cap: TreasuryCap<M_TOKEN>
+    }
+    
     /// One-time witness for module initialization and coin type
     public struct M_TOKEN has drop {}
     
@@ -96,7 +108,7 @@ module protocol_sui::m_token {
     // ============ Initialization ============
     
     /// Module initializer - automatically called when module is published
-    /// Creates the M currency using the one-time witness
+    /// Creates the M currency and protocol object
     fun init(witness: M_TOKEN, ctx: &mut TxContext) {
         // Create the M coin currency using OTW
         let (treasury_cap, metadata) = coin::create_currency(
@@ -112,20 +124,23 @@ module protocol_sui::m_token {
         // Freeze metadata to make it immutable and discoverable
         transfer::public_freeze_object(metadata);
         
-        // Transfer TreasuryCap to the publisher (will be sent to MinterGateway)
+        // Note: We don't create the protocol here since we need ttg_registrar_id
+        // The treasury_cap will be passed to create_protocol function
         transfer::public_transfer(treasury_cap, ctx.sender());
     }
     
-    /// Create MToken state object - called after module deployment
-    /// @param ttg_registrar_id: ID of the TTG Registrar shared object  
+    /// Create the protocol object with locked treasury cap
+    /// This should be called once after deployment with the treasury cap
+    /// @param treasury_cap: The treasury cap from init
+    /// @param ttg_registrar_id: ID of the TTG Registrar shared object
     /// @param ctx: Transaction context
-    public fun create_mtoken(
+    public fun create_protocol(
+        treasury_cap: TreasuryCap<M_TOKEN>,
         ttg_registrar_id: ID,
         ctx: &mut TxContext
     ) {
-        // Create the MToken shared object
-        let mtoken = MToken {
-            id: object::new(ctx),
+        // Create the MToken state
+        let state = MTokenState {
             ttg_registrar_id,
             total_non_earning_supply: 0,
             principal_of_total_earning_supply: 0,
@@ -133,8 +148,15 @@ module protocol_sui::m_token {
             earning_accounts: table::new(ctx)
         };
         
-        // Share the MToken object
-        transfer::share_object(mtoken);
+        // Create the protocol object with locked treasury cap
+        let protocol = MTokenProtocol {
+            id: object::new(ctx),
+            state,
+            treasury_cap  // Permanently locked here
+        };
+        
+        // Share the protocol object
+        transfer::share_object(protocol);
     }
 
     // ============ Test-Only Functions ============
@@ -149,61 +171,114 @@ module protocol_sui::m_token {
         let dummy_ttg_registrar = ttg_registrar::new_for_testing(ctx);
         let ttg_registrar_id = object::id(&dummy_ttg_registrar);
         
-        // Use the actual production function
-        create_mtoken(ttg_registrar_id, ctx);
+        // Create a treasury cap for testing
+        let (treasury_cap, metadata) = coin::create_currency<M_TOKEN>(
+            M_TOKEN {}, 
+            9,
+            b"M",
+            b"M Token",
+            b"The M protocol token on Sui",
+            option::none(),
+            ctx
+        );
         
-        // Clean up dummy
+        // Use the actual production function
+        create_protocol(treasury_cap, ttg_registrar_id, ctx);
+        
+        // Clean up dummy and metadata
         sui::test_utils::destroy(dummy_ttg_registrar);
+        transfer::public_transfer(metadata, ctx.sender());
     }
     
     #[test_only]
     /// Set total earning supply directly for testing earner rate model
-    public fun set_total_earning_supply(mtoken: &mut MToken, amount: u256) {
-        mtoken.principal_of_total_earning_supply = (amount as u128);
+    public fun set_total_earning_supply(state: &mut MTokenState, amount: u256) {
+        state.principal_of_total_earning_supply = (amount as u128);
+    }
+    
+    #[test_only]
+    /// Set total earning supply directly for testing earner rate model (protocol wrapper)
+    public fun set_total_earning_supply_protocol(protocol: &mut MTokenProtocol, amount: u256) {
+        protocol.state.principal_of_total_earning_supply = (amount as u128);
     }
     
     #[test_only]
     /// Add earning account for testing - simulates what start_earning would do
-    public fun add_earning_account_for_testing(mtoken: &mut MToken, account: address, principal: u128) {
-        let earning_state = EarningState { principal_amount: principal };
-        table::add(&mut mtoken.earning_accounts, account, earning_state);
-        mtoken.principal_of_total_earning_supply = mtoken.principal_of_total_earning_supply + principal;
+    public fun add_earning_account_for_testing(protocol: &mut MTokenProtocol, account: address, principal: u128) {
+        let earning_state = EarningState { 
+            principal_amount: principal,
+            last_claim_index: continuous_indexing::latest_index(&protocol.state.indexing)
+        };
+        table::add(&mut protocol.state.earning_accounts, account, earning_state);
+        protocol.state.principal_of_total_earning_supply = protocol.state.principal_of_total_earning_supply + principal;
     }
     
     #[test_only]
     /// Add non-earning amount for testing - simulates non-earning balance
-    public fun add_non_earning_amount_for_testing(mtoken: &mut MToken, amount: u256) {
-        mtoken.total_non_earning_supply = mtoken.total_non_earning_supply + amount;
+    public fun add_non_earning_amount_for_testing(protocol: &mut MTokenProtocol, amount: u256) {
+        protocol.state.total_non_earning_supply = protocol.state.total_non_earning_supply + amount;
     }
     
     #[test_only]
-    /// Create MToken for testing - returns local object instead of sharing
-    public fun new_for_testing(ttg_registrar_id: ID, ctx: &mut TxContext): MToken {
-        MToken {
-            id: object::new(ctx),
+    /// Get mutable state for testing
+    public fun state_mut_for_testing(protocol: &mut MTokenProtocol): &mut MTokenState {
+        &mut protocol.state
+    }
+    
+    #[test_only]
+    /// Get immutable state for testing  
+    public fun state_for_testing(protocol: &MTokenProtocol): &MTokenState {
+        &protocol.state
+    }
+    
+    #[test_only]
+    /// Create protocol for testing - returns local object instead of sharing
+    public fun new_for_testing(ttg_registrar_id: ID, ctx: &mut TxContext): MTokenProtocol {
+        use sui::test_utils;
+        
+        // Create treasury cap for testing
+        let (treasury_cap, metadata) = coin::create_currency(
+            M_TOKEN {},  
+            DECIMALS,
+            SYMBOL,
+            NAME,
+            b"M token for the M^0 protocol",
+            option::none(),
+            ctx
+        );
+        
+        test_utils::destroy(metadata);
+        
+        // Create the MToken state
+        let state = MTokenState {
             ttg_registrar_id,
             total_non_earning_supply: 0,
             principal_of_total_earning_supply: 0,
             indexing: continuous_indexing::new(ctx),
             earning_accounts: table::new(ctx)
+        };
+        
+        // Create the protocol object with locked treasury cap
+        MTokenProtocol {
+            id: object::new(ctx),
+            state,
+            treasury_cap
         }
     }
     
-    // NOTE: TreasuryCap testing functionality to be added later
-    // For now, tests will be done through integration testing with MinterGateway
+    // NOTE: The TreasuryCap is now locked inside the MTokenProtocol shared object
+    // This ensures secure access control while enabling protocol functionality
     
     // ============ Capability-Gated Functions ============
     
-    /// Mint M tokens - only callable by MinterGateway with TreasuryCap
-    /// @param mtoken: The MToken shared object
-    /// @param treasury_cap: TreasuryCap for minting coins and access control
+    /// Mint M tokens - only callable through the protocol object
+    /// @param protocol: The MTokenProtocol shared object with locked TreasuryCap
     /// @param account: Address to mint tokens to
     /// @param amount: Amount to mint (present value)
     /// @param ctx: Transaction context
     /// @return: Minted coins
     public fun mint(
-        mtoken: &mut MToken,
-        treasury_cap: &mut TreasuryCap<M_TOKEN>,
+        protocol: &mut MTokenProtocol,
         account: address,
         amount: u256,
         ctx: &mut TxContext
@@ -218,33 +293,33 @@ module protocol_sui::m_token {
         
         // Check overflow prevention (similar to Solidity)
         // If all tokens were converted to earning principal, would it overflow?
-        let new_total = mtoken.total_non_earning_supply + amount;
+        let new_total = protocol.state.total_non_earning_supply + amount;
         assert!(new_total <= 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF, EOverflowsPrincipalOfTotalSupply);
         
         // Update index first if there are earning accounts
-        if (mtoken.principal_of_total_earning_supply > 0) {
-            update_index(mtoken, ctx);
+        if (protocol.state.principal_of_total_earning_supply > 0) {
+            update_index(&mut protocol.state, ctx);
         };
         
         // Check if account is earning and update accounting
-        if (table::contains(&mtoken.earning_accounts, account)) {
+        if (table::contains(&protocol.state.earning_accounts, account)) {
             // Account is earning - convert present amount to principal
-            let principal_amount = get_principal_amount_rounded_down(amount, mtoken, ctx);
+            let principal_amount = get_principal_amount_rounded_down(amount, &protocol.state, ctx);
             
             // Check principal wouldn't overflow u128
-            let new_principal_total = (mtoken.principal_of_total_earning_supply as u256) + (principal_amount as u256);
+            let new_principal_total = (protocol.state.principal_of_total_earning_supply as u256) + (principal_amount as u256);
             assert!(new_principal_total <= 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF, EOverflowsPrincipalOfTotalSupply);
             
             // Update earning state
-            let earning_state = table::borrow_mut(&mut mtoken.earning_accounts, account);
+            let earning_state = table::borrow_mut(&mut protocol.state.earning_accounts, account);
             earning_state.principal_amount = earning_state.principal_amount + principal_amount;
             
             // Update total earning supply principal
-            mtoken.principal_of_total_earning_supply = 
-                mtoken.principal_of_total_earning_supply + principal_amount;
+            protocol.state.principal_of_total_earning_supply = 
+                protocol.state.principal_of_total_earning_supply + principal_amount;
         } else {
             // Account is non-earning - direct amount
-            mtoken.total_non_earning_supply = new_total;
+            protocol.state.total_non_earning_supply = new_total;
         };
         
         // Emit transfer event from zero address (minting)
@@ -257,18 +332,16 @@ module protocol_sui::m_token {
         // Mint and return the actual coins
         // Note: coin::mint expects u64, so we need to ensure amount fits
         assert!(amount <= 0xFFFFFFFFFFFFFFFF, EOverflowsPrincipalOfTotalSupply);
-        coin::mint(treasury_cap, (amount as u64), ctx)
+        coin::mint(&mut protocol.treasury_cap, (amount as u64), ctx)
     }
     
-    /// Burn M tokens - only callable by MinterGateway with TreasuryCap
-    /// @param mtoken: The MToken shared object  
-    /// @param treasury_cap: TreasuryCap for access control
+    /// Burn M tokens - only callable through the protocol object
+    /// @param protocol: The MTokenProtocol shared object with locked TreasuryCap
     /// @param account: Address to burn tokens from
     /// @param amount: Present amount to burn
     /// @param ctx: Transaction context
     public fun burn(
-        mtoken: &mut MToken,
-        _treasury_cap: &mut TreasuryCap<M_TOKEN>,
+        protocol: &mut MTokenProtocol,
         account: address,
         amount: u256,
         ctx: &mut TxContext
@@ -286,26 +359,26 @@ module protocol_sui::m_token {
         });
         
         // Check if account is earning and update accounting
-        if (table::contains(&mtoken.earning_accounts, account)) {
+        if (table::contains(&protocol.state.earning_accounts, account)) {
             // Account is earning - convert present amount to principal (rounded up for protocol)
-            update_index(mtoken, ctx);
+            update_index(&mut protocol.state, ctx);
             
-            let principal_amount = get_principal_amount_rounded_up(amount, mtoken, ctx);
+            let principal_amount = get_principal_amount_rounded_up(amount, &protocol.state, ctx);
             
             // Get earning state and check balance
-            let earning_state = table::borrow_mut(&mut mtoken.earning_accounts, account);
+            let earning_state = table::borrow_mut(&mut protocol.state.earning_accounts, account);
             assert!(earning_state.principal_amount >= principal_amount, EInsufficientBalance);
             
             // Update earning state
             earning_state.principal_amount = earning_state.principal_amount - principal_amount;
             
             // Update total earning supply principal
-            mtoken.principal_of_total_earning_supply = 
-                mtoken.principal_of_total_earning_supply - principal_amount;
+            protocol.state.principal_of_total_earning_supply = 
+                protocol.state.principal_of_total_earning_supply - principal_amount;
         } else {
             // Account is non-earning - direct amount
-            assert!(mtoken.total_non_earning_supply >= amount, EInsufficientBalance);
-            mtoken.total_non_earning_supply = mtoken.total_non_earning_supply - amount;
+            assert!(protocol.state.total_non_earning_supply >= amount, EInsufficientBalance);
+            protocol.state.total_non_earning_supply = protocol.state.total_non_earning_supply - amount;
         };
         
         // Note: Actual coin burning (destroying the coin objects) happens in MinterGateway
@@ -314,25 +387,25 @@ module protocol_sui::m_token {
     // ============ Public Functions ============
     
     /// Start earning for the caller - only approved earners can call this
-    /// @param mtoken: The MToken shared object
+    /// @param protocol: The MTokenProtocol shared object
     /// @param ctx: Transaction context 
-    public fun start_earning(mtoken: &mut MToken, ctx: &mut TxContext) {
+    public fun start_earning(protocol: &mut MTokenProtocol, ctx: &mut TxContext) {
         let caller = ctx.sender();
         
         // Check if caller is an approved earner (TODO: implement TTG check)
         // For now, we'll use a simple check - in production this would check TTG registrar
-        // assert!(is_approved_earner(mtoken, caller), ENotApprovedEarner);
+        // assert!(is_approved_earner(protocol, caller), ENotApprovedEarner);
         
-        start_earning_internal(mtoken, caller, ctx);
+        start_earning_internal(&mut protocol.state, caller, ctx);
     }
     
     /// Internal function to start earning for an account
-    /// @param mtoken: Mutable reference to MToken
+    /// @param state: Mutable reference to MTokenState
     /// @param account: Account to start earning for
     /// @param ctx: Transaction context
-    fun start_earning_internal(mtoken: &mut MToken, account: address, ctx: &mut TxContext) {
+    fun start_earning_internal(state: &mut MTokenState, account: address, ctx: &mut TxContext) {
         // Check if already earning
-        if (table::contains(&mtoken.earning_accounts, account)) {
+        if (table::contains(&state.earning_accounts, account)) {
             return // Already earning, nothing to do
         };
         
@@ -342,93 +415,109 @@ module protocol_sui::m_token {
         // Create earning account with 0 principal initially
         // In a full implementation, this would handle conversion of existing non-earning balance
         // to earning balance by converting present amount to principal amount
-        let earning_state = EarningState { principal_amount: 0 };
-        table::add(&mut mtoken.earning_accounts, account, earning_state);
+        let earning_state = EarningState { 
+            principal_amount: 0,
+            last_claim_index: get_current_index(state, ctx)
+        };
+        table::add(&mut state.earning_accounts, account, earning_state);
         
         // Update index
-        update_index(mtoken, ctx);
+        update_index(state, ctx);
     }
     
     /// Stop earning for the caller
-    /// @param mtoken: The MToken shared object
+    /// @param protocol: The MTokenProtocol shared object
     /// @param ctx: Transaction context
-    public fun stop_earning(mtoken: &mut MToken, ctx: &mut TxContext) {
+    public fun stop_earning(protocol: &mut MTokenProtocol, ctx: &mut TxContext) {
         let caller = ctx.sender();
-        stop_earning_internal(mtoken, caller, ctx);
+        stop_earning_internal(&mut protocol.state, caller, ctx);
     }
     
     /// Stop earning for a specific account - only works for non-approved earners
-    /// @param mtoken: The MToken shared object
+    /// @param protocol: The MTokenProtocol shared object
     /// @param account: Account to stop earning for
     /// @param ctx: Transaction context
-    public fun stop_earning_for_account(mtoken: &mut MToken, account: address, ctx: &mut TxContext) {
+    public fun stop_earning_for_account(protocol: &mut MTokenProtocol, account: address, ctx: &mut TxContext) {
         // Check if account is an approved earner - if so, they must stop themselves
         // TODO: implement TTG check
-        // assert!(!is_approved_earner(mtoken, account), EIsApprovedEarner);
+        // assert!(!is_approved_earner(protocol, account), EIsApprovedEarner);
         
-        stop_earning_internal(mtoken, account, ctx);
+        stop_earning_internal(&mut protocol.state, account, ctx);
     }
 
     // ============ View Functions ============
     
     /// Get the principal balance of an earning account (0 for non-earning accounts)
-    /// @param mtoken: Reference to MToken shared object  
+    /// @param protocol: Reference to MTokenProtocol shared object  
     /// @param account: Address to check principal balance for
     /// @return: Principal balance (0 if not earning)
-    public fun principal_balance_of(mtoken: &MToken, account: address): u128 {
-        if (!table::contains(&mtoken.earning_accounts, account)) {
+    public fun principal_balance_of(protocol: &MTokenProtocol, account: address): u128 {
+        if (!table::contains(&protocol.state.earning_accounts, account)) {
             return 0
         };
         
-        let earning_state = table::borrow(&mtoken.earning_accounts, account);
+        let earning_state = table::borrow(&protocol.state.earning_accounts, account);
         earning_state.principal_amount
     }
     
     /// Check if an account is earning
-    /// @param mtoken: Reference to MToken shared object
+    /// @param protocol: Reference to MTokenProtocol shared object
     /// @param account: Address to check earning status for  
     /// @return: True if account is earning, false otherwise
-    public fun is_earning(mtoken: &MToken, account: address): bool {
-        table::contains(&mtoken.earning_accounts, account)
+    public fun is_earning(protocol: &MTokenProtocol, account: address): bool {
+        table::contains(&protocol.state.earning_accounts, account)
     }
     
     /// Get the total earning supply (present amount)
-    /// @param mtoken: Reference to MToken shared object
+    /// @param protocol: Reference to MTokenProtocol shared object
     /// @param ctx: Transaction context for timestamp access
     /// @return: Total supply of earning tokens in present value
-    public fun total_earning_supply(mtoken: &MToken, ctx: &TxContext): u256 {
-        get_present_amount_from_principal(mtoken.principal_of_total_earning_supply, mtoken, ctx)
+    public fun total_earning_supply(protocol: &MTokenProtocol, ctx: &TxContext): u256 {
+        get_present_amount_from_principal(protocol.state.principal_of_total_earning_supply, &protocol.state, ctx)
+    }
+    
+    /// Get the total earning supply (present amount) from state directly
+    /// @param state: Reference to MTokenState
+    /// @param ctx: Transaction context for timestamp access
+    /// @return: Total supply of earning tokens in present value
+    public fun total_earning_supply_from_state(state: &MTokenState, ctx: &TxContext): u256 {
+        get_present_amount_from_principal(state.principal_of_total_earning_supply, state, ctx)
     }
     
     /// Get the total non-earning supply
-    /// @param mtoken: Reference to MToken shared object
+    /// @param protocol: Reference to MTokenProtocol shared object
     /// @return: Total supply of non-earning tokens
-    public fun total_non_earning_supply(mtoken: &MToken): u256 {
-        mtoken.total_non_earning_supply
+    public fun total_non_earning_supply(protocol: &MTokenProtocol): u256 {
+        protocol.state.total_non_earning_supply
     }
     
     /// Get the total supply (earning + non-earning)
-    /// @param mtoken: Reference to MToken shared object
+    /// @param protocol: Reference to MTokenProtocol shared object
     /// @param ctx: Transaction context for timestamp access
     /// @return: Total supply in present value terms
-    public fun total_supply(mtoken: &MToken, ctx: &TxContext): u256 {
-        total_non_earning_supply(mtoken) + total_earning_supply(mtoken, ctx)
+    public fun total_supply(protocol: &MTokenProtocol, ctx: &TxContext): u256 {
+        total_non_earning_supply(protocol) + total_earning_supply(protocol, ctx)
     }
     
     /// Get the TTG Registrar ID
-    public fun ttg_registrar_id(mtoken: &MToken): ID {
-        mtoken.ttg_registrar_id
+    public fun ttg_registrar_id(protocol: &MTokenProtocol): ID {
+        protocol.state.ttg_registrar_id
+    }
+    
+    /// Get a reference to the internal state
+    public fun get_state(protocol: &MTokenProtocol): &MTokenState {
+        &protocol.state
     }
     
     // ============ Internal Helper Functions ============
     
     /// Internal function to stop earning for an account
-    /// @param mtoken: Mutable reference to MToken
+    /// @param state: Mutable reference to MTokenState
     /// @param account: Account to stop earning for
     /// @param ctx: Transaction context
-    fun stop_earning_internal(mtoken: &mut MToken, account: address, ctx: &mut TxContext) {
+    fun stop_earning_internal(state: &mut MTokenState, account: address, ctx: &mut TxContext) {
         // Check if account is currently earning
-        if (!table::contains(&mtoken.earning_accounts, account)) {
+        if (!table::contains(&state.earning_accounts, account)) {
             return // Not earning, nothing to do
         };
         
@@ -436,40 +525,40 @@ module protocol_sui::m_token {
         sui::event::emit(StoppedEarningEvent { account });
         
         // Get the earning state and calculate present value
-        let earning_state = table::borrow(&mtoken.earning_accounts, account);
+        let earning_state = table::borrow(&state.earning_accounts, account);
         let principal_amount = earning_state.principal_amount;
         
         if (principal_amount > 0) {
             // Update index first
-            update_index(mtoken, ctx);
+            update_index(state, ctx);
             
             // Convert principal to present amount
-            let present_amount = get_present_amount_from_principal(principal_amount, mtoken, ctx);
+            let present_amount = get_present_amount_from_principal(principal_amount, state, ctx);
             
             // Update totals - remove from earning supply, add to non-earning supply  
-            mtoken.principal_of_total_earning_supply = 
-                mtoken.principal_of_total_earning_supply - principal_amount;
-            mtoken.total_non_earning_supply = mtoken.total_non_earning_supply + present_amount;
+            state.principal_of_total_earning_supply = 
+                state.principal_of_total_earning_supply - principal_amount;
+            state.total_non_earning_supply = state.total_non_earning_supply + present_amount;
         };
         
         // Remove from earning accounts table
-        table::remove(&mut mtoken.earning_accounts, account);
+        table::remove(&mut state.earning_accounts, account);
     }
     
     /// Update the index to the current timestamp
-    /// @param mtoken: Mutable reference to MToken for updating indexing state
+    /// @param state: Mutable reference to MTokenState for updating indexing state
     /// @param ctx: Transaction context for timestamp access
-    fun update_index(mtoken: &mut MToken, ctx: &TxContext) {
+    fun update_index(state: &mut MTokenState, ctx: &TxContext) {
         // Get current timestamp in seconds
         let current_timestamp = ctx.epoch_timestamp_ms() / 1000;
         
         // For now, use a fixed rate (will integrate with rate model later)
         // TODO: Get rate from TTG registrar's earner rate model
-        let current_rate = continuous_indexing::latest_rate(&mtoken.indexing);
+        let current_rate = continuous_indexing::latest_rate(&state.indexing);
         
         // Update the indexing state
         continuous_indexing::update_index(
-            &mut mtoken.indexing,
+            &mut state.indexing,
             current_rate,
             current_timestamp
         );
@@ -477,131 +566,301 @@ module protocol_sui::m_token {
     
     /// Convert principal amount to present amount using current index
     /// @param principal_amount: Principal amount to convert
-    /// @param mtoken: Reference to MToken for accessing current index
+    /// @param state: Reference to MTokenState for accessing current index
     /// @param ctx: Transaction context for timestamp access
     /// @return: Present amount (rounded down)
-    fun get_present_amount_from_principal(principal_amount: u128, mtoken: &MToken, ctx: &TxContext): u256 {
+    fun get_present_amount_from_principal(principal_amount: u128, state: &MTokenState, ctx: &TxContext): u256 {
         continuous_indexing::get_present_amount_rounded_down(
             principal_amount,
-            get_current_index(mtoken, ctx)
+            get_current_index(state, ctx)
         )
     }
     
     /// Convert present amount to principal amount (rounded down - favors protocol)
     /// @param present_amount: Present amount to convert
-    /// @param mtoken: Reference to MToken for accessing current index
+    /// @param state: Reference to MTokenState for accessing current index
     /// @param ctx: Transaction context for timestamp access
     /// @return: Principal amount (rounded down)
-    fun get_principal_amount_rounded_down(present_amount: u256, mtoken: &MToken, ctx: &TxContext): u128 {
+    fun get_principal_amount_rounded_down(present_amount: u256, state: &MTokenState, ctx: &TxContext): u128 {
         continuous_indexing::get_principal_amount_rounded_down(
             present_amount,
-            get_current_index(mtoken, ctx)
+            get_current_index(state, ctx)
         )
     }
     
     /// Convert present amount to principal amount (rounded up - favors protocol)
     /// @param present_amount: Present amount to convert  
-    /// @param mtoken: Reference to MToken for accessing current index
+    /// @param state: Reference to MTokenState for accessing current index
     /// @param ctx: Transaction context for timestamp access
     /// @return: Principal amount (rounded up)
-    fun get_principal_amount_rounded_up(present_amount: u256, mtoken: &MToken, ctx: &TxContext): u128 {
+    fun get_principal_amount_rounded_up(present_amount: u256, state: &MTokenState, ctx: &TxContext): u128 {
         continuous_indexing::get_principal_amount_rounded_up(
             present_amount,
-            get_current_index(mtoken, ctx)
+            get_current_index(state, ctx)
         )
     }
     
     /// Get the current index based on latest state and time elapsed
-    /// @param mtoken: Reference to MToken for accessing indexing state
+    /// @param state: Reference to MTokenState for accessing indexing state
     /// @param ctx: Transaction context for timestamp access
     /// @return: Current index value
-    fun get_current_index(mtoken: &MToken, ctx: &TxContext): u128 {
+    fun get_current_index(state: &MTokenState, ctx: &TxContext): u128 {
         continuous_indexing::calculate_current_index(
-            continuous_indexing::latest_index(&mtoken.indexing),
-            continuous_indexing::latest_rate(&mtoken.indexing), 
-            continuous_indexing::latest_update_timestamp(&mtoken.indexing),
+            continuous_indexing::latest_index(&state.indexing),
+            continuous_indexing::latest_rate(&state.indexing), 
+            continuous_indexing::latest_update_timestamp(&state.indexing),
             // Convert milliseconds to seconds for continuous indexing math
             ctx.epoch_timestamp_ms() / 1000
         )
     }
     
+    // ============ Claim Functions ============
+    
+    /// Calculate accrued interest for an earning account
+    /// @param protocol: Reference to MTokenProtocol
+    /// @param account: Account to calculate interest for
+    /// @param ctx: Transaction context
+    /// @return: Amount of accrued interest in present value
+    public fun calculate_accrued_interest(protocol: &MTokenProtocol, account: address, ctx: &TxContext): u64 {
+        if (!table::contains(&protocol.state.earning_accounts, account)) {
+            return 0
+        };
+        
+        let earning_state = table::borrow(&protocol.state.earning_accounts, account);
+        let current_index = get_current_index(&protocol.state, ctx);
+        
+        // If no time has passed or no principal, no interest accrued
+        if (current_index <= earning_state.last_claim_index || earning_state.principal_amount == 0) {
+            return 0
+        };
+        
+        // Calculate present value at current index
+        let current_present_value = continuous_indexing::get_present_amount_rounded_down(
+            earning_state.principal_amount,
+            current_index
+        );
+        
+        // Calculate present value at last claim index
+        let last_claim_present_value = continuous_indexing::get_present_amount_rounded_down(
+            earning_state.principal_amount,
+            earning_state.last_claim_index
+        );
+        
+        // Accrued interest is the difference
+        if (current_present_value > last_claim_present_value) {
+            ((current_present_value - last_claim_present_value) as u64)
+        } else {
+            0
+        }
+    }
+    
+    /// Claim accrued interest for an earning account
+    /// @param protocol: Mutable reference to MTokenProtocol
+    /// @param account: Account to claim interest for
+    /// @param ctx: Transaction context
+    /// @return: Coin with claimed interest
+    public fun claim_interest(
+        protocol: &mut MTokenProtocol,
+        account: address,
+        ctx: &mut TxContext
+    ): Coin<M_TOKEN> {
+        // Calculate accrued interest
+        let accrued_amount = calculate_accrued_interest(protocol, account, ctx);
+        
+        if (accrued_amount == 0) {
+            return coin::zero<M_TOKEN>(ctx)
+        };
+        
+        // Update the earning state's last claim index
+        let current_index = get_current_index(&protocol.state, ctx);
+        let earning_state = table::borrow_mut(&mut protocol.state.earning_accounts, account);
+        earning_state.last_claim_index = current_index;
+        
+        // Update index
+        update_index(&mut protocol.state, ctx);
+        
+        // Mint the accrued interest as new coins
+        coin::mint(&mut protocol.treasury_cap, accrued_amount, ctx)
+    }
+    
+    /// Auto-claim interest for an earning account (used in transfers)
+    /// @param protocol: Mutable reference to MTokenProtocol
+    /// @param account: Account to auto-claim for
+    /// @param ctx: Transaction context
+    /// @return: Coin with claimed interest (zero coin if no interest)
+    public fun auto_claim_interest(
+        protocol: &mut MTokenProtocol,
+        account: address,
+        ctx: &mut TxContext
+    ): Coin<M_TOKEN> {
+        if (is_earning(protocol, account)) {
+            claim_interest(protocol, account, ctx)
+        } else {
+            coin::zero<M_TOKEN>(ctx)
+        }
+    }
+    
+    // ============ Sui-Native Transfer Functions ============
+    
+    /// Transfer M_TOKEN with auto-claim for earning accounts
+    /// @param protocol: Mutable reference to MTokenProtocol
+    /// @param from_coin: Coin to transfer from
+    /// @param amount: Amount to transfer (in smallest units)
+    /// @param recipient: Recipient address
+    /// @param ctx: Transaction context
+    /// @return: (remaining_coin, claimed_interest_sender, claimed_interest_recipient)
+    public fun transfer_with_claim(
+        protocol: &mut MTokenProtocol,
+        mut from_coin: Coin<M_TOKEN>,
+        amount: u64,
+        recipient: address,
+        ctx: &mut TxContext
+    ): (Coin<M_TOKEN>, Coin<M_TOKEN>, Coin<M_TOKEN>) {
+        let sender = ctx.sender();
+        
+        // Auto-claim for sender if earning
+        let sender_claimed = auto_claim_interest(protocol, sender, ctx);
+        
+        // Auto-claim for recipient if earning
+        let recipient_claimed = auto_claim_interest(protocol, recipient, ctx);
+        
+        // Perform the actual coin transfer
+        let transfer_coin = coin::split(&mut from_coin, amount, ctx);
+        transfer::public_transfer(transfer_coin, recipient);
+        
+        // Emit transfer event for internal tracking
+        sui::event::emit(TransferEvent { 
+            from: sender, 
+            to: recipient, 
+            amount: (amount as u256)
+        });
+        
+        (from_coin, sender_claimed, recipient_claimed)
+    }
+    
+    /// Simple transfer function that handles auto-claim internally
+    /// @param protocol: Mutable reference to MTokenProtocol
+    /// @param from_coin: Coin to transfer from
+    /// @param amount: Amount to transfer
+    /// @param recipient: Recipient address
+    /// @param ctx: Transaction context
+    /// @return: remaining coin after transfer (with any claimed interest merged)
+    public fun transfer(
+        protocol: &mut MTokenProtocol,
+        from_coin: Coin<M_TOKEN>,
+        amount: u64,
+        recipient: address,
+        ctx: &mut TxContext
+    ): Coin<M_TOKEN> {
+        let (remaining_coin, sender_claimed, recipient_claimed) = transfer_with_claim(
+            protocol, from_coin, amount, recipient, ctx
+        );
+        
+        // Merge sender's claimed interest with remaining coin
+        let mut final_coin = remaining_coin;
+        coin::join(&mut final_coin, sender_claimed);
+        
+        // Transfer recipient's claimed interest directly to them
+        if (coin::value(&recipient_claimed) > 0) {
+            transfer::public_transfer(recipient_claimed, recipient);
+        } else {
+            coin::destroy_zero(recipient_claimed);
+        };
+        
+        final_coin
+    }
+    
+    /// Public claim function for users to manually claim their interest
+    /// @param protocol: Mutable reference to MTokenProtocol
+    /// @param ctx: Transaction context
+    /// @return: Coin with claimed interest
+    public fun claim(
+        protocol: &mut MTokenProtocol,
+        ctx: &mut TxContext
+    ): Coin<M_TOKEN> {
+        claim_interest(protocol, ctx.sender(), ctx)
+    }
+    
     // ============ Transfer Helper Functions ============
     
     /// Add earning amount to an account by increasing its principal
-    /// @param mtoken: Mutable reference to MToken
+    /// @param protocol: Mutable reference to MTokenProtocol
     /// @param account: Account to add principal to
     /// @param principal_amount: Principal amount to add
-    public fun add_earning_amount(mtoken: &mut MToken, account: address, principal_amount: u128) {
+    public fun add_earning_amount(protocol: &mut MTokenProtocol, account: address, principal_amount: u128) {
         if (principal_amount == 0) return;
         
         // Get or create earning state for account
-        if (!table::contains(&mtoken.earning_accounts, account)) {
-            let earning_state = EarningState { principal_amount: 0 };
-            table::add(&mut mtoken.earning_accounts, account, earning_state);
+        if (!table::contains(&protocol.state.earning_accounts, account)) {
+            let earning_state = EarningState { 
+                principal_amount: 0,
+                last_claim_index: continuous_indexing::latest_index(&protocol.state.indexing)
+            };
+            table::add(&mut protocol.state.earning_accounts, account, earning_state);
         };
         
-        let earning_state = table::borrow_mut(&mut mtoken.earning_accounts, account);
+        let earning_state = table::borrow_mut(&mut protocol.state.earning_accounts, account);
         earning_state.principal_amount = earning_state.principal_amount + principal_amount;
         
         // Update total earning supply
-        mtoken.principal_of_total_earning_supply = 
-            mtoken.principal_of_total_earning_supply + principal_amount;
+        protocol.state.principal_of_total_earning_supply = 
+            protocol.state.principal_of_total_earning_supply + principal_amount;
     }
     
     /// Subtract earning amount from an account by decreasing its principal
-    /// @param mtoken: Mutable reference to MToken
+    /// @param protocol: Mutable reference to MTokenProtocol
     /// @param account: Account to subtract principal from
     /// @param principal_amount: Principal amount to subtract
-    public fun subtract_earning_amount(mtoken: &mut MToken, account: address, principal_amount: u128) {
+    public fun subtract_earning_amount(protocol: &mut MTokenProtocol, account: address, principal_amount: u128) {
         if (principal_amount == 0) return;
         
-        assert!(table::contains(&mtoken.earning_accounts, account), EInsufficientBalance);
+        assert!(table::contains(&protocol.state.earning_accounts, account), EInsufficientBalance);
         
-        let earning_state = table::borrow_mut(&mut mtoken.earning_accounts, account);
+        let earning_state = table::borrow_mut(&mut protocol.state.earning_accounts, account);
         assert!(earning_state.principal_amount >= principal_amount, EInsufficientBalance);
         
         earning_state.principal_amount = earning_state.principal_amount - principal_amount;
         
         // Update total earning supply
-        mtoken.principal_of_total_earning_supply = 
-            mtoken.principal_of_total_earning_supply - principal_amount;
+        protocol.state.principal_of_total_earning_supply = 
+            protocol.state.principal_of_total_earning_supply - principal_amount;
     }
     
     /// Add non-earning amount to the total non-earning supply
-    /// @param mtoken: Mutable reference to MToken
+    /// @param protocol: Mutable reference to MTokenProtocol
     /// @param amount: Present amount to add to non-earning supply
-    public fun add_non_earning_amount(mtoken: &mut MToken, amount: u256) {
+    public fun add_non_earning_amount(protocol: &mut MTokenProtocol, amount: u256) {
         if (amount == 0) return;
-        mtoken.total_non_earning_supply = mtoken.total_non_earning_supply + amount;
+        protocol.state.total_non_earning_supply = protocol.state.total_non_earning_supply + amount;
     }
     
     /// Subtract non-earning amount from the total non-earning supply
-    /// @param mtoken: Mutable reference to MToken
+    /// @param protocol: Mutable reference to MTokenProtocol
     /// @param amount: Present amount to subtract from non-earning supply
-    public fun subtract_non_earning_amount(mtoken: &mut MToken, amount: u256) {
+    public fun subtract_non_earning_amount(protocol: &mut MTokenProtocol, amount: u256) {
         if (amount == 0) return;
-        assert!(mtoken.total_non_earning_supply >= amount, EInsufficientBalance);
-        mtoken.total_non_earning_supply = mtoken.total_non_earning_supply - amount;
+        assert!(protocol.state.total_non_earning_supply >= amount, EInsufficientBalance);
+        protocol.state.total_non_earning_supply = protocol.state.total_non_earning_supply - amount;
     }
     
     /// Internal transfer logic when sender and recipient have same earning status
-    /// @param mtoken: Mutable reference to MToken
+    /// @param protocol: Mutable reference to MTokenProtocol
     /// @param sender: Sending account
     /// @param recipient: Receiving account
     /// @param amount: Amount to transfer (principal if earning, present if non-earning)
     fun transfer_in_kind(
-        mtoken: &mut MToken, 
+        protocol: &mut MTokenProtocol, 
         sender: address, 
         recipient: address, 
         amount: u256
     ) {
-        let is_earning = is_earning(mtoken, sender);
+        let is_earning = is_earning(protocol, sender);
         
         if (is_earning) {
             // Transfer principal amount between earning accounts
             let principal_amount = (amount as u128);
-            subtract_earning_amount(mtoken, sender, principal_amount);
-            add_earning_amount(mtoken, recipient, principal_amount);
+            subtract_earning_amount(protocol, sender, principal_amount);
+            add_earning_amount(protocol, recipient, principal_amount);
         } else {
             // For non-earning accounts, we just track total supply changes
             // Individual balances are managed by Coin objects in Sui
@@ -610,13 +869,13 @@ module protocol_sui::m_token {
     }
     
     /// Main internal transfer function handling all transfer types
-    /// @param mtoken: Mutable reference to MToken
+    /// @param protocol: Mutable reference to MTokenProtocol
     /// @param sender: Sending account
     /// @param recipient: Receiving account  
     /// @param amount: Present amount to transfer
     /// @param ctx: Transaction context
     public fun transfer_internal(
-        mtoken: &mut MToken,
+        protocol: &mut MTokenProtocol,
         sender: address,
         recipient: address,
         amount: u256,
@@ -635,15 +894,15 @@ module protocol_sui::m_token {
             amount 
         });
         
-        let sender_is_earning = is_earning(mtoken, sender);
-        let recipient_is_earning = is_earning(mtoken, recipient);
+        let sender_is_earning = is_earning(protocol, sender);
+        let recipient_is_earning = is_earning(protocol, recipient);
         
         // Handle in-kind transfer (same earning status)
         if (sender_is_earning == recipient_is_earning) {
             if (sender_is_earning) {
                 // Both earning: convert amount to principal and transfer
-                let principal = get_principal_amount_rounded_up(amount, mtoken, ctx);
-                transfer_in_kind(mtoken, sender, recipient, (principal as u256));
+                let principal = get_principal_amount_rounded_up(amount, &protocol.state, ctx);
+                transfer_in_kind(protocol, sender, recipient, (principal as u256));
             } else {
                 // Both non-earning: handled by Coin transfer in Sui
                 // No internal state updates needed
@@ -654,18 +913,18 @@ module protocol_sui::m_token {
         // Handle cross-type transfer (different earning status)
         if (sender_is_earning) {
             // Sender earning, recipient non-earning
-            let principal = get_principal_amount_rounded_up(amount, mtoken, ctx);
-            subtract_earning_amount(mtoken, sender, principal);
-            add_non_earning_amount(mtoken, amount);
+            let principal = get_principal_amount_rounded_up(amount, &protocol.state, ctx);
+            subtract_earning_amount(protocol, sender, principal);
+            add_non_earning_amount(protocol, amount);
         } else {
             // Sender non-earning, recipient earning
-            let principal = get_principal_amount_rounded_down(amount, mtoken, ctx);
-            subtract_non_earning_amount(mtoken, amount);
-            add_earning_amount(mtoken, recipient, principal);
+            let principal = get_principal_amount_rounded_down(amount, &protocol.state, ctx);
+            subtract_non_earning_amount(protocol, amount);
+            add_earning_amount(protocol, recipient, principal);
         };
         
         // Update index after transfer
-        update_index(mtoken, ctx);
+        update_index(&mut protocol.state, ctx);
     }
     
 }
