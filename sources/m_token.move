@@ -171,6 +171,12 @@ module protocol_sui::m_token {
     }
     
     #[test_only]
+    /// Add non-earning amount for testing - simulates non-earning balance
+    public fun add_non_earning_amount_for_testing(mtoken: &mut MToken, amount: u256) {
+        mtoken.total_non_earning_supply = mtoken.total_non_earning_supply + amount;
+    }
+    
+    #[test_only]
     /// Create MToken for testing - returns local object instead of sharing
     public fun new_for_testing(ttg_registrar_id: ID, ctx: &mut TxContext): MToken {
         MToken {
@@ -517,6 +523,149 @@ module protocol_sui::m_token {
             // Convert milliseconds to seconds for continuous indexing math
             ctx.epoch_timestamp_ms() / 1000
         )
+    }
+    
+    // ============ Transfer Helper Functions ============
+    
+    /// Add earning amount to an account by increasing its principal
+    /// @param mtoken: Mutable reference to MToken
+    /// @param account: Account to add principal to
+    /// @param principal_amount: Principal amount to add
+    public fun add_earning_amount(mtoken: &mut MToken, account: address, principal_amount: u128) {
+        if (principal_amount == 0) return;
+        
+        // Get or create earning state for account
+        if (!table::contains(&mtoken.earning_accounts, account)) {
+            let earning_state = EarningState { principal_amount: 0 };
+            table::add(&mut mtoken.earning_accounts, account, earning_state);
+        };
+        
+        let earning_state = table::borrow_mut(&mut mtoken.earning_accounts, account);
+        earning_state.principal_amount = earning_state.principal_amount + principal_amount;
+        
+        // Update total earning supply
+        mtoken.principal_of_total_earning_supply = 
+            mtoken.principal_of_total_earning_supply + principal_amount;
+    }
+    
+    /// Subtract earning amount from an account by decreasing its principal
+    /// @param mtoken: Mutable reference to MToken
+    /// @param account: Account to subtract principal from
+    /// @param principal_amount: Principal amount to subtract
+    public fun subtract_earning_amount(mtoken: &mut MToken, account: address, principal_amount: u128) {
+        if (principal_amount == 0) return;
+        
+        assert!(table::contains(&mtoken.earning_accounts, account), EInsufficientBalance);
+        
+        let earning_state = table::borrow_mut(&mut mtoken.earning_accounts, account);
+        assert!(earning_state.principal_amount >= principal_amount, EInsufficientBalance);
+        
+        earning_state.principal_amount = earning_state.principal_amount - principal_amount;
+        
+        // Update total earning supply
+        mtoken.principal_of_total_earning_supply = 
+            mtoken.principal_of_total_earning_supply - principal_amount;
+    }
+    
+    /// Add non-earning amount to the total non-earning supply
+    /// @param mtoken: Mutable reference to MToken
+    /// @param amount: Present amount to add to non-earning supply
+    public fun add_non_earning_amount(mtoken: &mut MToken, amount: u256) {
+        if (amount == 0) return;
+        mtoken.total_non_earning_supply = mtoken.total_non_earning_supply + amount;
+    }
+    
+    /// Subtract non-earning amount from the total non-earning supply
+    /// @param mtoken: Mutable reference to MToken
+    /// @param amount: Present amount to subtract from non-earning supply
+    public fun subtract_non_earning_amount(mtoken: &mut MToken, amount: u256) {
+        if (amount == 0) return;
+        assert!(mtoken.total_non_earning_supply >= amount, EInsufficientBalance);
+        mtoken.total_non_earning_supply = mtoken.total_non_earning_supply - amount;
+    }
+    
+    /// Internal transfer logic when sender and recipient have same earning status
+    /// @param mtoken: Mutable reference to MToken
+    /// @param sender: Sending account
+    /// @param recipient: Receiving account
+    /// @param amount: Amount to transfer (principal if earning, present if non-earning)
+    fun transfer_in_kind(
+        mtoken: &mut MToken, 
+        sender: address, 
+        recipient: address, 
+        amount: u256
+    ) {
+        let is_earning = is_earning(mtoken, sender);
+        
+        if (is_earning) {
+            // Transfer principal amount between earning accounts
+            let principal_amount = (amount as u128);
+            subtract_earning_amount(mtoken, sender, principal_amount);
+            add_earning_amount(mtoken, recipient, principal_amount);
+        } else {
+            // For non-earning accounts, we just track total supply changes
+            // Individual balances are managed by Coin objects in Sui
+            // This is a no-op for total supply since it's an in-kind transfer
+        }
+    }
+    
+    /// Main internal transfer function handling all transfer types
+    /// @param mtoken: Mutable reference to MToken
+    /// @param sender: Sending account
+    /// @param recipient: Receiving account  
+    /// @param amount: Present amount to transfer
+    /// @param ctx: Transaction context
+    public fun transfer_internal(
+        mtoken: &mut MToken,
+        sender: address,
+        recipient: address,
+        amount: u256,
+        ctx: &mut TxContext
+    ) {
+        // Check for invalid recipient (zero address)
+        assert!(recipient != @0x0, EInvalidRecipient);
+        
+        // Check if amount is valid
+        assert!(amount > 0, EInsufficientAmount);
+        
+        // Emit transfer event
+        sui::event::emit(TransferEvent { 
+            from: sender, 
+            to: recipient, 
+            amount 
+        });
+        
+        let sender_is_earning = is_earning(mtoken, sender);
+        let recipient_is_earning = is_earning(mtoken, recipient);
+        
+        // Handle in-kind transfer (same earning status)
+        if (sender_is_earning == recipient_is_earning) {
+            if (sender_is_earning) {
+                // Both earning: convert amount to principal and transfer
+                let principal = get_principal_amount_rounded_up(amount, mtoken, ctx);
+                transfer_in_kind(mtoken, sender, recipient, (principal as u256));
+            } else {
+                // Both non-earning: handled by Coin transfer in Sui
+                // No internal state updates needed
+            };
+            return
+        };
+        
+        // Handle cross-type transfer (different earning status)
+        if (sender_is_earning) {
+            // Sender earning, recipient non-earning
+            let principal = get_principal_amount_rounded_up(amount, mtoken, ctx);
+            subtract_earning_amount(mtoken, sender, principal);
+            add_non_earning_amount(mtoken, amount);
+        } else {
+            // Sender non-earning, recipient earning
+            let principal = get_principal_amount_rounded_down(amount, mtoken, ctx);
+            subtract_non_earning_amount(mtoken, amount);
+            add_earning_amount(mtoken, recipient, principal);
+        };
+        
+        // Update index after transfer
+        update_index(mtoken, ctx);
     }
     
 }
