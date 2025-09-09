@@ -203,7 +203,8 @@ module protocol_sui::earner_rate_model_tests {
             let rate = earner_rate_model::rate_with_refs(
                 &minter_gateway,
                 &m_token,
-                &ttg_registrar
+                &ttg_registrar,
+                test_scenario::ctx(&mut scenario)
             );
             
             // Should return the extra safe rate (1875) since it's less than max (2000)

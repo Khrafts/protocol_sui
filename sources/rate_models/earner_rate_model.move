@@ -34,13 +34,14 @@ module protocol_sui::earner_rate_model {
     public fun rate_with_refs(
         minter_gateway: &MinterGateway,
         m_token: &MToken,
-        ttg_registrar: &TTGRegistrar
+        ttg_registrar: &TTGRegistrar,
+        ctx: &TxContext
     ): u256 {
         // Fetch values from protocol modules - exactly like Solidity does
         let max_earner_rate = ttg_registrar::get_max_earner_rate(ttg_registrar);
         let minter_rate = minter_gateway::minter_rate(minter_gateway);
         let total_active_owed_m = minter_gateway::total_active_owed_m(minter_gateway);
-        let total_earning_supply = m_token::total_earning_supply(m_token);
+        let total_earning_supply = m_token::total_earning_supply(m_token, ctx);
         
         // Call the pure calculation function
         rate(max_earner_rate, minter_rate, total_active_owed_m, total_earning_supply)

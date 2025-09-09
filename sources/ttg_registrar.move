@@ -1,5 +1,8 @@
 module protocol_sui::ttg_registrar {
     use sui::table::{Self, Table};
+    use sui::object::{Self, UID};
+    use sui::tx_context::TxContext;
+    use sui::transfer;
     
     // ============ Constants ============
     
@@ -75,6 +78,22 @@ module protocol_sui::ttg_registrar {
         set(registrar, BASE_MINTER_RATE_KEY, value);
     }
 
+    #[test_only]
+    public fun new_for_testing(ctx: &mut TxContext): TTGRegistrar {
+        let mut config = table::new<vector<u8>, u256>(ctx);
+        
+        // Set default max earner rate to 10% (1000 basis points)
+        table::add(&mut config, MAX_EARNER_RATE_KEY, 1000);
+        
+        // Set default base minter rate to 5% (500 basis points)
+        table::add(&mut config, BASE_MINTER_RATE_KEY, 500);
+        
+        TTGRegistrar {
+            id: object::new(ctx),
+            config,
+        }
+    }
+    
     #[test_only]
     public fun initialize(ctx: &mut TxContext) {
         init(ctx);
