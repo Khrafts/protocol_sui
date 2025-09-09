@@ -4,6 +4,7 @@ module protocol_sui::m_token_test {
     use protocol_sui::m_token::{Self, MToken};
     use protocol_sui::ttg_registrar::{Self, TTGRegistrar};
     use sui::object;
+    use sui::coin;
 
     // Test addresses
     const ALICE: address = @0xa11ce;
@@ -204,6 +205,9 @@ module protocol_sui::m_token_test {
         test_scenario::end(scenario);
     }
 
+    // NOTE: Mint function tests will be added when TreasuryCap testing is properly set up
+    // For now, we'll focus on testing the view functions and state management
+    
     #[test]
     fun test_multiple_earning_accounts() {
         let mut scenario = test_scenario::begin(DEPLOYER);

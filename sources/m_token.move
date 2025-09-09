@@ -89,10 +89,7 @@ module protocol_sui::m_token {
         earning_accounts: Table<address, EarningState>
     }
     
-    /// The coin type for M token
-    public struct M has drop {}
-    
-    /// One-time witness for module initialization
+    /// One-time witness for module initialization and coin type
     public struct M_TOKEN has drop {}
     
 
@@ -186,52 +183,126 @@ module protocol_sui::m_token {
         }
     }
     
+    // NOTE: TreasuryCap testing functionality to be added later
+    // For now, tests will be done through integration testing with MinterGateway
+    
     // ============ Capability-Gated Functions ============
     
     /// Mint M tokens - only callable by MinterGateway with TreasuryCap
     /// @param mtoken: The MToken shared object
     /// @param treasury_cap: TreasuryCap for minting coins and access control
     /// @param account: Address to mint tokens to
-    /// @param amount: Amount to mint
+    /// @param amount: Amount to mint (present value)
+    /// @param ctx: Transaction context
+    /// @return: Minted coins
     public fun mint(
-        _mtoken: &mut MToken,
-        _treasury_cap: &mut TreasuryCap<M>,
-        _account: address,
-        _amount: u256
-    ) {
+        mtoken: &mut MToken,
+        treasury_cap: &mut TreasuryCap<M_TOKEN>,
+        account: address,
+        amount: u256,
+        ctx: &mut TxContext
+    ): coin::Coin<M_TOKEN> {
         // Access control is implicitly handled by TreasuryCap ownership
         
-        // Placeholder - will implement full mint logic
-        // This would:
-        // 1. Check if account is earning or non-earning
-        // 2. Update appropriate supply counters
-        // 3. Mint actual coins using treasury_cap
-        // 4. Update balances table
-        // 5. Emit events
-        abort 0
+        // Check amount is not zero
+        assert!(amount > 0, EInsufficientAmount);
+        
+        // Check recipient is not zero address
+        assert!(account != @0x0, EInvalidRecipient);
+        
+        // Check overflow prevention (similar to Solidity)
+        // If all tokens were converted to earning principal, would it overflow?
+        let new_total = mtoken.total_non_earning_supply + amount;
+        assert!(new_total <= 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF, EOverflowsPrincipalOfTotalSupply);
+        
+        // Update index first if there are earning accounts
+        if (mtoken.principal_of_total_earning_supply > 0) {
+            update_index(mtoken, ctx);
+        };
+        
+        // Check if account is earning and update accounting
+        if (table::contains(&mtoken.earning_accounts, account)) {
+            // Account is earning - convert present amount to principal
+            let principal_amount = get_principal_amount_rounded_down(amount, mtoken, ctx);
+            
+            // Check principal wouldn't overflow u128
+            let new_principal_total = (mtoken.principal_of_total_earning_supply as u256) + (principal_amount as u256);
+            assert!(new_principal_total <= 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF, EOverflowsPrincipalOfTotalSupply);
+            
+            // Update earning state
+            let earning_state = table::borrow_mut(&mut mtoken.earning_accounts, account);
+            earning_state.principal_amount = earning_state.principal_amount + principal_amount;
+            
+            // Update total earning supply principal
+            mtoken.principal_of_total_earning_supply = 
+                mtoken.principal_of_total_earning_supply + principal_amount;
+        } else {
+            // Account is non-earning - direct amount
+            mtoken.total_non_earning_supply = new_total;
+        };
+        
+        // Emit transfer event from zero address (minting)
+        sui::event::emit(TransferEvent { 
+            from: @0x0, 
+            to: account, 
+            amount 
+        });
+        
+        // Mint and return the actual coins
+        // Note: coin::mint expects u64, so we need to ensure amount fits
+        assert!(amount <= 0xFFFFFFFFFFFFFFFF, EOverflowsPrincipalOfTotalSupply);
+        coin::mint(treasury_cap, (amount as u64), ctx)
     }
     
     /// Burn M tokens - only callable by MinterGateway with TreasuryCap
-    /// @param mtoken: The MToken shared object
+    /// @param mtoken: The MToken shared object  
     /// @param treasury_cap: TreasuryCap for access control
     /// @param account: Address to burn tokens from
-    /// @param amount: Amount to burn
+    /// @param amount: Present amount to burn
+    /// @param ctx: Transaction context
     public fun burn(
-        _mtoken: &mut MToken,
-        _treasury_cap: &mut TreasuryCap<M>,
-        _account: address,
-        _amount: u256
+        mtoken: &mut MToken,
+        _treasury_cap: &mut TreasuryCap<M_TOKEN>,
+        account: address,
+        amount: u256,
+        ctx: &mut TxContext
     ) {
         // Access control is implicitly handled by TreasuryCap ownership
         
-        // Placeholder - will implement full burn logic
-        // This would:
-        // 1. Check account balance is sufficient
-        // 2. Update appropriate supply counters
-        // 3. Update balances table
-        // 4. Emit events
-        // Note: Actual coin burning happens in MinterGateway
-        abort 0
+        // Check amount is not zero
+        assert!(amount > 0, EInsufficientAmount);
+        
+        // Emit transfer event to zero address (burning)
+        sui::event::emit(TransferEvent { 
+            from: account, 
+            to: @0x0, 
+            amount 
+        });
+        
+        // Check if account is earning and update accounting
+        if (table::contains(&mtoken.earning_accounts, account)) {
+            // Account is earning - convert present amount to principal (rounded up for protocol)
+            update_index(mtoken, ctx);
+            
+            let principal_amount = get_principal_amount_rounded_up(amount, mtoken, ctx);
+            
+            // Get earning state and check balance
+            let earning_state = table::borrow_mut(&mut mtoken.earning_accounts, account);
+            assert!(earning_state.principal_amount >= principal_amount, EInsufficientBalance);
+            
+            // Update earning state
+            earning_state.principal_amount = earning_state.principal_amount - principal_amount;
+            
+            // Update total earning supply principal
+            mtoken.principal_of_total_earning_supply = 
+                mtoken.principal_of_total_earning_supply - principal_amount;
+        } else {
+            // Account is non-earning - direct amount
+            assert!(mtoken.total_non_earning_supply >= amount, EInsufficientBalance);
+            mtoken.total_non_earning_supply = mtoken.total_non_earning_supply - amount;
+        };
+        
+        // Note: Actual coin burning (destroying the coin objects) happens in MinterGateway
     }
     
     // ============ View Functions ============
@@ -286,6 +357,25 @@ module protocol_sui::m_token {
     }
     
     // ============ Internal Helper Functions ============
+    
+    /// Update the index to the current timestamp
+    /// @param mtoken: Mutable reference to MToken for updating indexing state
+    /// @param ctx: Transaction context for timestamp access
+    fun update_index(mtoken: &mut MToken, ctx: &TxContext) {
+        // Get current timestamp in seconds
+        let current_timestamp = ctx.epoch_timestamp_ms() / 1000;
+        
+        // For now, use a fixed rate (will integrate with rate model later)
+        // TODO: Get rate from TTG registrar's earner rate model
+        let current_rate = continuous_indexing::latest_rate(&mtoken.indexing);
+        
+        // Update the indexing state
+        continuous_indexing::update_index(
+            &mut mtoken.indexing,
+            current_rate,
+            current_timestamp
+        );
+    }
     
     /// Convert principal amount to present amount using current index
     /// @param principal_amount: Principal amount to convert
