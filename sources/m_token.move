@@ -61,7 +61,7 @@ module protocol_sui::m_token {
     // ============ Structs ============
     
     /// Earning account state - tracks principal amount for earning accounts
-    public struct EarningState has store {
+    public struct EarningState has store, drop {
         /// Principal amount for this earning account (uint112 → u128)  
         principal_amount: u128
     }
@@ -305,6 +305,64 @@ module protocol_sui::m_token {
         // Note: Actual coin burning (destroying the coin objects) happens in MinterGateway
     }
     
+    // ============ Public Functions ============
+    
+    /// Start earning for the caller - only approved earners can call this
+    /// @param mtoken: The MToken shared object
+    /// @param ctx: Transaction context 
+    public fun start_earning(mtoken: &mut MToken, ctx: &mut TxContext) {
+        let caller = ctx.sender();
+        
+        // Check if caller is an approved earner (TODO: implement TTG check)
+        // For now, we'll use a simple check - in production this would check TTG registrar
+        // assert!(is_approved_earner(mtoken, caller), ENotApprovedEarner);
+        
+        start_earning_internal(mtoken, caller, ctx);
+    }
+    
+    /// Internal function to start earning for an account
+    /// @param mtoken: Mutable reference to MToken
+    /// @param account: Account to start earning for
+    /// @param ctx: Transaction context
+    fun start_earning_internal(mtoken: &mut MToken, account: address, ctx: &mut TxContext) {
+        // Check if already earning
+        if (table::contains(&mtoken.earning_accounts, account)) {
+            return // Already earning, nothing to do
+        };
+        
+        // Emit event
+        sui::event::emit(StartedEarningEvent { account });
+        
+        // Create earning account with 0 principal initially
+        // In a full implementation, this would handle conversion of existing non-earning balance
+        // to earning balance by converting present amount to principal amount
+        let earning_state = EarningState { principal_amount: 0 };
+        table::add(&mut mtoken.earning_accounts, account, earning_state);
+        
+        // Update index
+        update_index(mtoken, ctx);
+    }
+    
+    /// Stop earning for the caller
+    /// @param mtoken: The MToken shared object
+    /// @param ctx: Transaction context
+    public fun stop_earning(mtoken: &mut MToken, ctx: &mut TxContext) {
+        let caller = ctx.sender();
+        stop_earning_internal(mtoken, caller, ctx);
+    }
+    
+    /// Stop earning for a specific account - only works for non-approved earners
+    /// @param mtoken: The MToken shared object
+    /// @param account: Account to stop earning for
+    /// @param ctx: Transaction context
+    public fun stop_earning_for_account(mtoken: &mut MToken, account: address, ctx: &mut TxContext) {
+        // Check if account is an approved earner - if so, they must stop themselves
+        // TODO: implement TTG check
+        // assert!(!is_approved_earner(mtoken, account), EIsApprovedEarner);
+        
+        stop_earning_internal(mtoken, account, ctx);
+    }
+
     // ============ View Functions ============
     
     /// Get the principal balance of an earning account (0 for non-earning accounts)
@@ -357,6 +415,40 @@ module protocol_sui::m_token {
     }
     
     // ============ Internal Helper Functions ============
+    
+    /// Internal function to stop earning for an account
+    /// @param mtoken: Mutable reference to MToken
+    /// @param account: Account to stop earning for
+    /// @param ctx: Transaction context
+    fun stop_earning_internal(mtoken: &mut MToken, account: address, ctx: &mut TxContext) {
+        // Check if account is currently earning
+        if (!table::contains(&mtoken.earning_accounts, account)) {
+            return // Not earning, nothing to do
+        };
+        
+        // Emit event
+        sui::event::emit(StoppedEarningEvent { account });
+        
+        // Get the earning state and calculate present value
+        let earning_state = table::borrow(&mtoken.earning_accounts, account);
+        let principal_amount = earning_state.principal_amount;
+        
+        if (principal_amount > 0) {
+            // Update index first
+            update_index(mtoken, ctx);
+            
+            // Convert principal to present amount
+            let present_amount = get_present_amount_from_principal(principal_amount, mtoken, ctx);
+            
+            // Update totals - remove from earning supply, add to non-earning supply  
+            mtoken.principal_of_total_earning_supply = 
+                mtoken.principal_of_total_earning_supply - principal_amount;
+            mtoken.total_non_earning_supply = mtoken.total_non_earning_supply + present_amount;
+        };
+        
+        // Remove from earning accounts table
+        table::remove(&mut mtoken.earning_accounts, account);
+    }
     
     /// Update the index to the current timestamp
     /// @param mtoken: Mutable reference to MToken for updating indexing state

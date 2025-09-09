@@ -240,4 +240,198 @@ module protocol_sui::m_token_test {
         sui::test_utils::destroy(ttg_registrar);
         test_scenario::end(scenario);
     }
+
+    #[test]
+    fun test_start_earning_basic() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        // Initially Alice is not earning
+        assert!(!m_token::is_earning(&mtoken, ALICE), 0);
+
+        next_tx(&mut scenario, ALICE);
+        let ctx = ctx(&mut scenario);
+
+        // Alice starts earning
+        m_token::start_earning(&mut mtoken, ctx);
+
+        // Now Alice should be earning with 0 principal initially
+        assert!(m_token::is_earning(&mtoken, ALICE), 1);
+        assert!(m_token::principal_balance_of(&mtoken, ALICE) == 0, 2);
+
+        // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    fun test_start_earning_already_earning() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        // Add earning account first
+        m_token::add_earning_account_for_testing(&mut mtoken, ALICE, 1000);
+
+        next_tx(&mut scenario, ALICE);
+        let ctx = ctx(&mut scenario);
+
+        // Alice tries to start earning again - should be no-op
+        m_token::start_earning(&mut mtoken, ctx);
+
+        // Should still be earning with same principal
+        assert!(m_token::is_earning(&mtoken, ALICE), 0);
+        assert!(m_token::principal_balance_of(&mtoken, ALICE) == 1000, 1);
+
+        // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    fun test_stop_earning_basic() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        // Add earning account with principal
+        m_token::add_earning_account_for_testing(&mut mtoken, ALICE, 1000);
+
+        next_tx(&mut scenario, ALICE);
+        let ctx = ctx(&mut scenario);
+
+        // Alice stops earning
+        m_token::stop_earning(&mut mtoken, ctx);
+
+        // Now Alice should not be earning
+        assert!(!m_token::is_earning(&mtoken, ALICE), 0);
+
+        // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    fun test_stop_earning_not_earning() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        next_tx(&mut scenario, ALICE);
+        let ctx = ctx(&mut scenario);
+
+        // Alice tries to stop earning when not earning - should be no-op
+        m_token::stop_earning(&mut mtoken, ctx);
+
+        // Alice should still not be earning
+        assert!(!m_token::is_earning(&mtoken, ALICE), 0);
+
+        // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    fun test_stop_earning_for_account() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        // Add earning account with principal
+        m_token::add_earning_account_for_testing(&mut mtoken, ALICE, 2000);
+
+        next_tx(&mut scenario, BOB);
+        let ctx = ctx(&mut scenario);
+
+        // Bob stops earning for Alice (assuming Alice is not approved earner)
+        m_token::stop_earning_for_account(&mut mtoken, ALICE, ctx);
+
+        // Alice should no longer be earning
+        assert!(!m_token::is_earning(&mtoken, ALICE), 0);
+
+        // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    fun test_earning_supply_tracking() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        // Add earning account with principal
+        m_token::add_earning_account_for_testing(&mut mtoken, ALICE, 1500);
+
+        next_tx(&mut scenario, ALICE);
+        let ctx = ctx(&mut scenario);
+
+        // Check initial earning supply
+        let initial_earning_supply = m_token::total_earning_supply(&mtoken, ctx);
+        assert!(initial_earning_supply >= 1500, 0);
+
+        // Alice stops earning
+        m_token::stop_earning(&mut mtoken, ctx);
+
+        // Earning supply should now be 0
+        let final_earning_supply = m_token::total_earning_supply(&mtoken, ctx);
+        assert!(final_earning_supply == 0, 1);
+
+        // Non-earning supply should have increased
+        let non_earning_supply = m_token::total_non_earning_supply(&mtoken);
+        assert!(non_earning_supply > 0, 2);
+
+        // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    fun test_multiple_accounts_start_stop_earning() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        next_tx(&mut scenario, ALICE);
+        let ctx = ctx(&mut scenario);
+
+        // Alice starts earning
+        m_token::start_earning(&mut mtoken, ctx);
+        assert!(m_token::is_earning(&mtoken, ALICE), 0);
+
+        next_tx(&mut scenario, BOB);
+        let ctx = ctx(&mut scenario);
+
+        // Bob starts earning
+        m_token::start_earning(&mut mtoken, ctx);
+        assert!(m_token::is_earning(&mtoken, BOB), 1);
+
+        next_tx(&mut scenario, CHARLIE);
+        let ctx = ctx(&mut scenario);
+
+        // Charlie starts earning
+        m_token::start_earning(&mut mtoken, ctx);
+        assert!(m_token::is_earning(&mtoken, CHARLIE), 2);
+
+        // All three should be earning
+        assert!(m_token::is_earning(&mtoken, ALICE), 3);
+        assert!(m_token::is_earning(&mtoken, BOB), 4);
+        assert!(m_token::is_earning(&mtoken, CHARLIE), 5);
+
+        next_tx(&mut scenario, BOB);
+        let ctx = ctx(&mut scenario);
+
+        // Bob stops earning
+        m_token::stop_earning(&mut mtoken, ctx);
+
+        // Bob should no longer be earning, others should still be
+        assert!(m_token::is_earning(&mtoken, ALICE), 6);
+        assert!(!m_token::is_earning(&mtoken, BOB), 7);
+        assert!(m_token::is_earning(&mtoken, CHARLIE), 8);
+
+        // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
 }
