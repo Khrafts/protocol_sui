@@ -1,7 +1,7 @@
 #[test_only]
 module protocol_sui::m_token_test {
     use sui::test_scenario::{Self, Scenario, next_tx, ctx};
-    use protocol_sui::m_token::{Self, MTokenProtocol, EarningCap};
+    use protocol_sui::m_token::{Self, MTokenProtocol, EarningCap, MinterCap};
     use protocol_sui::ttg_registrar::{Self, TTGRegistrar};
     use sui::object;
     use sui::coin;
@@ -648,6 +648,254 @@ module protocol_sui::m_token_test {
         assert!(!m_token::is_earning(&mtoken, CHARLIE), 2);
 
         // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    // ============ MinterCap Tests ============
+
+    #[test]
+    fun test_mint_with_minter_cap() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        next_tx(&mut scenario, DEPLOYER);
+        let ctx = ctx(&mut scenario);
+
+        // Create a MinterCap for testing
+        let minter_cap = m_token::new_minter_cap_for_testing(ctx);
+
+        // Mint tokens using MinterCap
+        let mut minted_coin = m_token::mint(&mut mtoken, &minter_cap, ALICE, 5000, ctx);
+        
+        // Verify the mint was successful
+        assert!(coin::value(&minted_coin) == 5000, 0);
+
+        // Clean up
+        sui::test_utils::destroy(minted_coin);
+        sui::test_utils::destroy(minter_cap);
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    fun test_burn_with_minter_cap() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        // Add some earning balance for testing burn
+        m_token::add_earning_account_for_testing(&mut mtoken, ALICE, 2000);
+
+        next_tx(&mut scenario, DEPLOYER);
+        let ctx = ctx(&mut scenario);
+
+        // Create a MinterCap for testing
+        let minter_cap = m_token::new_minter_cap_for_testing(ctx);
+
+        // Burn tokens using MinterCap
+        m_token::burn(&mut mtoken, &minter_cap, ALICE, 1000, ctx);
+        
+        // Verify the burn reduced the balance
+        assert!(m_token::principal_balance_of(&mtoken, ALICE) < 2000, 0);
+
+        // Clean up
+        sui::test_utils::destroy(minter_cap);
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = protocol_sui::m_token::EInsufficientAmount)]
+    fun test_mint_zero_amount_fails() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        next_tx(&mut scenario, DEPLOYER);
+        let ctx = ctx(&mut scenario);
+
+        let minter_cap = m_token::new_minter_cap_for_testing(ctx);
+
+        // Try to mint zero amount - should fail
+        let minted_coin = m_token::mint(&mut mtoken, &minter_cap, ALICE, 0, ctx);
+
+        // Clean up (won't reach here due to abort)
+        coin::destroy_zero(minted_coin);
+        sui::test_utils::destroy(minter_cap);
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    #[expected_failure(abort_code = protocol_sui::m_token::EInsufficientAmount)]
+    fun test_burn_zero_amount_fails() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        next_tx(&mut scenario, DEPLOYER);
+        let ctx = ctx(&mut scenario);
+
+        let minter_cap = m_token::new_minter_cap_for_testing(ctx);
+
+        // Try to burn zero amount - should fail
+        m_token::burn(&mut mtoken, &minter_cap, ALICE, 0, ctx);
+
+        // Clean up (won't reach here due to abort)
+        sui::test_utils::destroy(minter_cap);
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    // ============ Rate Model Integration Tests ============
+
+    #[test]
+    fun test_update_index_with_external_rate() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        // Add some earning accounts so index updates matter
+        m_token::add_earning_account_for_testing(&mut mtoken, ALICE, 1000);
+
+        next_tx(&mut scenario, DEPLOYER);
+        let ctx = ctx(&mut scenario);
+
+        // Update index with external rate (5% APY = 500 basis points)
+        m_token::update_index_with_external_rate(&mut mtoken, 500, ctx);
+
+        // The update should succeed (no return value to check, but no abort means success)
+
+        // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    // ============ Balance Conversion Tests ============
+
+    #[test]
+    fun test_start_earning_with_balance() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        // Add some non-earning supply to simulate existing balance
+        m_token::add_non_earning_amount_for_testing(&mut mtoken, 5000);
+
+        next_tx(&mut scenario, ALICE);
+        let ctx = ctx(&mut scenario);
+
+        // Alice starts earning with 5000 token balance
+        m_token::start_earning_self(&mut mtoken, 5000, ctx);
+
+        // Verify Alice is now earning with principal amount
+        assert!(m_token::is_earning(&mtoken, ALICE), 0);
+        assert!(m_token::principal_balance_of(&mtoken, ALICE) > 0, 1);
+
+        // Non-earning supply should have decreased
+        assert!(m_token::total_non_earning_supply(&mtoken) < 5000, 2);
+
+        // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    fun test_stop_earning_returns_values() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        // Add earning account with principal
+        m_token::add_earning_account_for_testing(&mut mtoken, ALICE, 3000);
+
+        next_tx(&mut scenario, ALICE);
+        let ctx = ctx(&mut scenario);
+
+        // Stop earning and check return values
+        let (present_value, principal) = m_token::stop_earning_self(&mut mtoken, ctx);
+
+        // Should return positive values
+        assert!(present_value > 0, 0);
+        assert!(principal == 3000, 1);
+
+        // Alice should no longer be earning
+        assert!(!m_token::is_earning(&mtoken, ALICE), 2);
+
+        // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    // ============ Interest Claiming Tests ============
+
+    #[test]
+    fun test_calculate_accrued_interest_zero() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        next_tx(&mut scenario, ALICE);
+        let ctx = ctx(&mut scenario);
+
+        // Calculate interest for non-earning account
+        let interest = m_token::calculate_accrued_interest(&mtoken, ALICE, ctx);
+        assert!(interest == 0, 0);
+
+        // Clean up
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    fun test_claim_interest_zero() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        next_tx(&mut scenario, ALICE);
+        let ctx = ctx(&mut scenario);
+
+        // Claim interest for non-earning account
+        let claimed_coin = m_token::claim(&mut mtoken, ctx);
+        assert!(coin::value(&claimed_coin) == 0, 0);
+
+        // Clean up
+        coin::destroy_zero(claimed_coin);
+        sui::test_utils::destroy(mtoken);
+        sui::test_utils::destroy(ttg_registrar);
+        test_scenario::end(scenario);
+    }
+
+    // ============ Transfer Integration Tests ============
+
+    #[test]
+    fun test_transfer_with_claim_zero() {
+        let mut scenario = test_scenario::begin(DEPLOYER);
+        let (mut mtoken, ttg_registrar, _) = setup_test_protocol(&mut scenario);
+
+        next_tx(&mut scenario, ALICE);
+        let ctx = ctx(&mut scenario);
+
+        // Create a coin to transfer
+        let test_coin = coin::mint_for_testing<protocol_sui::m_token::M_TOKEN>(1000, ctx);
+
+        // Transfer with claim (should return zero claims for non-earning accounts)
+        let (mut remaining_coin, sender_claimed, recipient_claimed) = m_token::transfer_with_claim(
+            &mut mtoken, test_coin, 500, BOB, ctx
+        );
+
+        // Verify zero claims
+        assert!(coin::value(&sender_claimed) == 0, 0);
+        assert!(coin::value(&recipient_claimed) == 0, 1);
+        assert!(coin::value(&remaining_coin) == 500, 2);
+
+        // Clean up
+        sui::test_utils::destroy(remaining_coin);
+        coin::destroy_zero(sender_claimed);
+        coin::destroy_zero(recipient_claimed);
         sui::test_utils::destroy(mtoken);
         sui::test_utils::destroy(ttg_registrar);
         test_scenario::end(scenario);
