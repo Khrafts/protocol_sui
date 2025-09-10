@@ -104,6 +104,18 @@ module protocol_sui::m_token {
     /// One-time witness for module initialization and coin type
     public struct M_TOKEN has drop {}
     
+    /// Capability for earning management - allows holder to start/stop earning for approved accounts
+    /// This is created during init and sent to the protocol owner
+    public struct EarningCap has key, store {
+        id: UID
+    }
+    
+    /// Capability for minting/burning tokens - allows holder to mint/burn M tokens
+    /// This is created during init and sent to the minter gateway
+    public struct MinterCap has key, store {
+        id: UID
+    }
+    
 
     // ============ Initialization ============
     
@@ -123,6 +135,18 @@ module protocol_sui::m_token {
         
         // Freeze metadata to make it immutable and discoverable
         transfer::public_freeze_object(metadata);
+        
+        // Create the EarningCap and send to the deployer
+        let earning_cap = EarningCap {
+            id: object::new(ctx)
+        };
+        transfer::public_transfer(earning_cap, ctx.sender());
+        
+        // Create the MinterCap and send to the deployer (they will transfer to minter gateway)
+        let minter_cap = MinterCap {
+            id: object::new(ctx)
+        };
+        transfer::public_transfer(minter_cap, ctx.sender());
         
         // Note: We don't create the protocol here since we need ttg_registrar_id
         // The treasury_cap will be passed to create_protocol function
@@ -160,6 +184,22 @@ module protocol_sui::m_token {
     }
 
     // ============ Test-Only Functions ============
+    
+    #[test_only]
+    /// Create an EarningCap for testing
+    public fun new_earning_cap_for_testing(ctx: &mut TxContext): EarningCap {
+        EarningCap {
+            id: object::new(ctx)
+        }
+    }
+    
+    #[test_only]
+    /// Create a MinterCap for testing
+    public fun new_minter_cap_for_testing(ctx: &mut TxContext): MinterCap {
+        MinterCap {
+            id: object::new(ctx)
+        }
+    }
     
     #[test_only]
     /// Initialize for other modules' tests that expect shared objects
@@ -271,19 +311,21 @@ module protocol_sui::m_token {
     
     // ============ Capability-Gated Functions ============
     
-    /// Mint M tokens - only callable through the protocol object
+    /// Mint M tokens - only callable with MinterCap
     /// @param protocol: The MTokenProtocol shared object with locked TreasuryCap
+    /// @param _cap: MinterCap proving authorization to mint
     /// @param account: Address to mint tokens to
     /// @param amount: Amount to mint (present value)
     /// @param ctx: Transaction context
     /// @return: Minted coins
     public fun mint(
         protocol: &mut MTokenProtocol,
+        _cap: &MinterCap,
         account: address,
         amount: u256,
         ctx: &mut TxContext
     ): coin::Coin<M_TOKEN> {
-        // Access control is implicitly handled by TreasuryCap ownership
+        // Access control handled by MinterCap requirement
         
         // Check amount is not zero
         assert!(amount > 0, EInsufficientAmount);
@@ -335,18 +377,20 @@ module protocol_sui::m_token {
         coin::mint(&mut protocol.treasury_cap, (amount as u64), ctx)
     }
     
-    /// Burn M tokens - only callable through the protocol object
+    /// Burn M tokens - only callable with MinterCap
     /// @param protocol: The MTokenProtocol shared object with locked TreasuryCap
+    /// @param _cap: MinterCap proving authorization to burn
     /// @param account: Address to burn tokens from
     /// @param amount: Present amount to burn
     /// @param ctx: Transaction context
     public fun burn(
         protocol: &mut MTokenProtocol,
+        _cap: &MinterCap,
         account: address,
         amount: u256,
         ctx: &mut TxContext
     ) {
-        // Access control is implicitly handled by TreasuryCap ownership
+        // Access control handled by MinterCap requirement
         
         // Check amount is not zero
         assert!(amount > 0, EInsufficientAmount);
@@ -386,24 +430,32 @@ module protocol_sui::m_token {
     
     // ============ Public Functions ============
     
-    /// Start earning for the caller - only approved earners can call this
+    /// Start earning for an account - requires EarningCap
     /// @param protocol: The MTokenProtocol shared object
-    /// @param ctx: Transaction context 
-    public fun start_earning(protocol: &mut MTokenProtocol, ctx: &mut TxContext) {
-        let caller = ctx.sender();
-        
-        // Check if caller is an approved earner (TODO: implement TTG check)
+    /// @param _cap: The EarningCap capability (proves authorization)
+    /// @param account: Account to start earning for
+    /// @param balance: Current coin balance of the account (fetched client-side)
+    /// @param ctx: Transaction context
+    public fun start_earning(
+        protocol: &mut MTokenProtocol,
+        _cap: &EarningCap,
+        account: address,
+        balance: u64,
+        ctx: &mut TxContext
+    ) {
+        // Check if account is an approved earner (TODO: implement TTG check)
         // For now, we'll use a simple check - in production this would check TTG registrar
-        // assert!(is_approved_earner(protocol, caller), ENotApprovedEarner);
+        // assert!(is_approved_earner(protocol, account), ENotApprovedEarner);
         
-        start_earning_internal(&mut protocol.state, caller, ctx);
+        start_earning_internal(&mut protocol.state, account, balance, ctx);
     }
     
     /// Internal function to start earning for an account
     /// @param state: Mutable reference to MTokenState
     /// @param account: Account to start earning for
+    /// @param amount: Present amount to convert to earning principal
     /// @param ctx: Transaction context
-    fun start_earning_internal(state: &mut MTokenState, account: address, ctx: &mut TxContext) {
+    fun start_earning_internal(state: &mut MTokenState, account: address, amount: u64, ctx: &mut TxContext) {
         // Check if already earning
         if (table::contains(&state.earning_accounts, account)) {
             return // Already earning, nothing to do
@@ -412,37 +464,123 @@ module protocol_sui::m_token {
         // Emit event
         sui::event::emit(StartedEarningEvent { account });
         
-        // Create earning account with 0 principal initially
-        // In a full implementation, this would handle conversion of existing non-earning balance
-        // to earning balance by converting present amount to principal amount
+        // Update index first
+        update_index(state, ctx);
+        
+        // Convert present amount to principal (rounded down favors protocol)
+        let principal_amount = if (amount > 0) {
+            let present_amount = (amount as u256);
+            // Subtract from non-earning supply
+            assert!(state.total_non_earning_supply >= present_amount, EInsufficientBalance);
+            state.total_non_earning_supply = state.total_non_earning_supply - present_amount;
+            
+            // Convert to principal amount
+            get_principal_amount_rounded_down(present_amount, state, ctx)
+        } else {
+            0
+        };
+        
+        // Create earning account
         let earning_state = EarningState { 
-            principal_amount: 0,
+            principal_amount,
             last_claim_index: get_current_index(state, ctx)
         };
         table::add(&mut state.earning_accounts, account, earning_state);
         
-        // Update index
-        update_index(state, ctx);
+        // Add to earning supply principal
+        state.principal_of_total_earning_supply = state.principal_of_total_earning_supply + principal_amount;
     }
     
-    /// Stop earning for the caller
+    /// Start earning for the caller (self) - no cap required but must be approved earner
+    /// @param protocol: The MTokenProtocol shared object
+    /// @param balance: Current coin balance of the caller (fetched client-side)
+    /// @param ctx: Transaction context
+    public fun start_earning_self(
+        protocol: &mut MTokenProtocol,
+        balance: u64,
+        ctx: &mut TxContext
+    ) {
+        let caller = ctx.sender();
+        
+        // Check if caller is an approved earner (TODO: implement TTG check)
+        // assert!(is_approved_earner(protocol, caller), ENotApprovedEarner);
+        
+        start_earning_internal(&mut protocol.state, caller, balance, ctx);
+    }
+    
+    /// Stop earning for the caller (self) - no cap required
     /// @param protocol: The MTokenProtocol shared object
     /// @param ctx: Transaction context
-    public fun stop_earning(protocol: &mut MTokenProtocol, ctx: &mut TxContext) {
+    /// @return: (present_value, principal_amount) - values for client-side handling
+    public fun stop_earning_self(
+        protocol: &mut MTokenProtocol,
+        ctx: &mut TxContext
+    ): (u64, u128) {
         let caller = ctx.sender();
-        stop_earning_internal(&mut protocol.state, caller, ctx);
+        stop_earning_internal(&mut protocol.state, caller, ctx)
     }
     
-    /// Stop earning for a specific account - only works for non-approved earners
+    /// Stop earning for an account - requires EarningCap
     /// @param protocol: The MTokenProtocol shared object
+    /// @param _cap: The EarningCap capability (proves authorization)
     /// @param account: Account to stop earning for
     /// @param ctx: Transaction context
-    public fun stop_earning_for_account(protocol: &mut MTokenProtocol, account: address, ctx: &mut TxContext) {
-        // Check if account is an approved earner - if so, they must stop themselves
-        // TODO: implement TTG check
+    /// @return: (present_value, principal_amount) - the present value that should be minted and the principal that was removed
+    public fun stop_earning(
+        protocol: &mut MTokenProtocol,
+        _cap: &EarningCap,
+        account: address,
+        ctx: &mut TxContext
+    ): (u64, u128) {
+        // Can stop earning for any account with the cap (admin function)
+        // In production, might want to add restriction for approved earners
         // assert!(!is_approved_earner(protocol, account), EIsApprovedEarner);
         
-        stop_earning_internal(&mut protocol.state, account, ctx);
+        stop_earning_internal(&mut protocol.state, account, ctx)
+    }
+    
+    /// Internal function to stop earning for an account
+    /// @param state: Mutable reference to MTokenState
+    /// @param account: Account to stop earning for
+    /// @param ctx: Transaction context
+    /// @return: (present_value, principal_amount) - values for client-side handling
+    fun stop_earning_internal(state: &mut MTokenState, account: address, ctx: &mut TxContext): (u64, u128) {
+        // Check if account is currently earning
+        if (!table::contains(&state.earning_accounts, account)) {
+            // Not earning, return zero values
+            return (0, 0)
+        };
+        
+        // Emit event
+        sui::event::emit(StoppedEarningEvent { account });
+        
+        // Update index first
+        update_index(state, ctx);
+        
+        // Get the earning state and calculate present value
+        let earning_state = table::borrow(&state.earning_accounts, account);
+        let principal_amount = earning_state.principal_amount;
+        
+        let present_amount = if (principal_amount > 0) {
+            // Convert principal to present amount
+            let present_amount = get_present_amount_from_principal(principal_amount, state, ctx);
+            
+            // Update totals - remove from earning supply, add to non-earning supply  
+            state.principal_of_total_earning_supply = 
+                state.principal_of_total_earning_supply - principal_amount;
+            state.total_non_earning_supply = state.total_non_earning_supply + present_amount;
+            
+            present_amount
+        } else {
+            0
+        };
+        
+        // Remove from earning accounts table
+        table::remove(&mut state.earning_accounts, account);
+        
+        // Return the present amount and principal for client-side handling
+        assert!(present_amount <= 0xFFFFFFFFFFFFFFFF, EOverflowsPrincipalOfTotalSupply);
+        ((present_amount as u64), principal_amount)
     }
 
     // ============ View Functions ============
@@ -509,52 +647,43 @@ module protocol_sui::m_token {
         &protocol.state
     }
     
-    // ============ Internal Helper Functions ============
-    
-    /// Internal function to stop earning for an account
-    /// @param state: Mutable reference to MTokenState
-    /// @param account: Account to stop earning for
+    /// Update index using externally calculated rate (from rate model)
+    /// @param protocol: Mutable reference to MTokenProtocol
+    /// @param rate: The rate to use (calculated by external caller using rate model)
     /// @param ctx: Transaction context
-    fun stop_earning_internal(state: &mut MTokenState, account: address, ctx: &mut TxContext) {
-        // Check if account is currently earning
-        if (!table::contains(&state.earning_accounts, account)) {
-            return // Not earning, nothing to do
-        };
-        
-        // Emit event
-        sui::event::emit(StoppedEarningEvent { account });
-        
-        // Get the earning state and calculate present value
-        let earning_state = table::borrow(&state.earning_accounts, account);
-        let principal_amount = earning_state.principal_amount;
-        
-        if (principal_amount > 0) {
-            // Update index first
-            update_index(state, ctx);
-            
-            // Convert principal to present amount
-            let present_amount = get_present_amount_from_principal(principal_amount, state, ctx);
-            
-            // Update totals - remove from earning supply, add to non-earning supply  
-            state.principal_of_total_earning_supply = 
-                state.principal_of_total_earning_supply - principal_amount;
-            state.total_non_earning_supply = state.total_non_earning_supply + present_amount;
-        };
-        
-        // Remove from earning accounts table
-        table::remove(&mut state.earning_accounts, account);
+    public fun update_index_with_external_rate(
+        protocol: &mut MTokenProtocol,
+        rate: u32,
+        ctx: &TxContext
+    ) {
+        update_index_with_rate(&mut protocol.state, ctx, option::some(rate));
     }
+    
+    // ============ Internal Helper Functions ============
     
     /// Update the index to the current timestamp
     /// @param state: Mutable reference to MTokenState for updating indexing state
     /// @param ctx: Transaction context for timestamp access
     fun update_index(state: &mut MTokenState, ctx: &TxContext) {
+        update_index_with_rate(state, ctx, option::none())
+    }
+    
+    /// Update the index with a specific rate (for external rate model integration)
+    /// @param state: Mutable reference to MTokenState for updating indexing state
+    /// @param ctx: Transaction context for timestamp access
+    /// @param rate_override: Optional rate to use instead of fetching from rate model
+    public fun update_index_with_rate(state: &mut MTokenState, ctx: &TxContext, rate_override: option::Option<u32>) {
         // Get current timestamp in seconds
         let current_timestamp = ctx.epoch_timestamp_ms() / 1000;
         
-        // For now, use a fixed rate (will integrate with rate model later)
-        // TODO: Get rate from TTG registrar's earner rate model
-        let current_rate = continuous_indexing::latest_rate(&state.indexing);
+        // Use provided rate or fall back to current rate
+        let current_rate = if (option::is_some(&rate_override)) {
+            option::destroy_some(rate_override)
+        } else {
+            // TODO: This could be enhanced to integrate with rate model
+            // For now, use the latest rate from indexing state
+            continuous_indexing::latest_rate(&state.indexing)
+        };
         
         // Update the indexing state
         continuous_indexing::update_index(

@@ -1,7 +1,7 @@
 #[test_only]
 module protocol_sui::m_token_test {
     use sui::test_scenario::{Self, Scenario, next_tx, ctx};
-    use protocol_sui::m_token::{Self, MTokenProtocol};
+    use protocol_sui::m_token::{Self, MTokenProtocol, EarningCap};
     use protocol_sui::ttg_registrar::{Self, TTGRegistrar};
     use sui::object;
     use sui::coin;
@@ -252,8 +252,8 @@ module protocol_sui::m_token_test {
         next_tx(&mut scenario, ALICE);
         let ctx = ctx(&mut scenario);
 
-        // Alice starts earning
-        m_token::start_earning(&mut mtoken, ctx);
+        // Alice starts earning with 0 balance (no coins yet)
+        m_token::start_earning_self(&mut mtoken, 0, ctx);
 
         // Now Alice should be earning with 0 principal initially
         assert!(m_token::is_earning(&mtoken, ALICE), 1);
@@ -277,7 +277,7 @@ module protocol_sui::m_token_test {
         let ctx = ctx(&mut scenario);
 
         // Alice tries to start earning again - should be no-op
-        m_token::start_earning(&mut mtoken, ctx);
+        m_token::start_earning_self(&mut mtoken, 0, ctx);
 
         // Should still be earning with same principal
         assert!(m_token::is_earning(&mtoken, ALICE), 0);
@@ -301,7 +301,7 @@ module protocol_sui::m_token_test {
         let ctx = ctx(&mut scenario);
 
         // Alice stops earning
-        m_token::stop_earning(&mut mtoken, ctx);
+        let (_present_value, _principal) = m_token::stop_earning_self(&mut mtoken, ctx);
 
         // Now Alice should not be earning
         assert!(!m_token::is_earning(&mtoken, ALICE), 0);
@@ -321,10 +321,14 @@ module protocol_sui::m_token_test {
         let ctx = ctx(&mut scenario);
 
         // Alice tries to stop earning when not earning - should be no-op
-        m_token::stop_earning(&mut mtoken, ctx);
+        let (present_value, principal) = m_token::stop_earning_self(&mut mtoken, ctx);
+        
+        // Should return zero values
+        assert!(present_value == 0, 0);
+        assert!(principal == 0, 1);
 
         // Alice should still not be earning
-        assert!(!m_token::is_earning(&mtoken, ALICE), 0);
+        assert!(!m_token::is_earning(&mtoken, ALICE), 2);
 
         // Clean up
         sui::test_utils::destroy(mtoken);
@@ -343,13 +347,17 @@ module protocol_sui::m_token_test {
         next_tx(&mut scenario, BOB);
         let ctx = ctx(&mut scenario);
 
-        // Bob stops earning for Alice (assuming Alice is not approved earner)
-        m_token::stop_earning_for_account(&mut mtoken, ALICE, ctx);
+        // Create an EarningCap for testing
+        let earning_cap = m_token::new_earning_cap_for_testing(ctx);
+
+        // Bob stops earning for Alice using the cap
+        let (_present_value, _principal) = m_token::stop_earning(&mut mtoken, &earning_cap, ALICE, ctx);
 
         // Alice should no longer be earning
         assert!(!m_token::is_earning(&mtoken, ALICE), 0);
 
         // Clean up
+        sui::test_utils::destroy(earning_cap);
         sui::test_utils::destroy(mtoken);
         sui::test_utils::destroy(ttg_registrar);
         test_scenario::end(scenario);
@@ -371,7 +379,7 @@ module protocol_sui::m_token_test {
         assert!(initial_earning_supply >= 1500, 0);
 
         // Alice stops earning
-        m_token::stop_earning(&mut mtoken, ctx);
+        let (_present_value, _principal) = m_token::stop_earning_self(&mut mtoken, ctx);
 
         // Earning supply should now be 0
         let final_earning_supply = m_token::total_earning_supply(&mtoken, ctx);
@@ -396,21 +404,21 @@ module protocol_sui::m_token_test {
         let ctx = ctx(&mut scenario);
 
         // Alice starts earning
-        m_token::start_earning(&mut mtoken, ctx);
+        m_token::start_earning_self(&mut mtoken, 0, ctx);
         assert!(m_token::is_earning(&mtoken, ALICE), 0);
 
         next_tx(&mut scenario, BOB);
         let ctx = ctx(&mut scenario);
 
         // Bob starts earning
-        m_token::start_earning(&mut mtoken, ctx);
+        m_token::start_earning_self(&mut mtoken, 0, ctx);
         assert!(m_token::is_earning(&mtoken, BOB), 1);
 
         next_tx(&mut scenario, CHARLIE);
         let ctx = ctx(&mut scenario);
 
         // Charlie starts earning
-        m_token::start_earning(&mut mtoken, ctx);
+        m_token::start_earning_self(&mut mtoken, 0, ctx);
         assert!(m_token::is_earning(&mtoken, CHARLIE), 2);
 
         // All three should be earning
@@ -422,7 +430,7 @@ module protocol_sui::m_token_test {
         let ctx = ctx(&mut scenario);
 
         // Bob stops earning
-        m_token::stop_earning(&mut mtoken, ctx);
+        let (_present_value, _principal) = m_token::stop_earning_self(&mut mtoken, ctx);
 
         // Bob should no longer be earning, others should still be
         assert!(m_token::is_earning(&mtoken, ALICE), 6);
