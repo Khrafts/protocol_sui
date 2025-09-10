@@ -27,6 +27,7 @@ protocol_sui/
 │   └── libs/                     # Mathematical utilities
 ├── tests/                        # Comprehensive test suite
 └── Move.toml                     # Project configuration
+```
 
 ## Core Modules
 
